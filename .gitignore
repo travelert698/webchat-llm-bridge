@@ -1,0 +1,17 @@
+# Python virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Browser data folders
+browser_data/
+.browser_data/
+
+# IDE and OS files 
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
