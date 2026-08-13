@@ -1,5 +1,12 @@
 """
 server.py – OpenAI-compatible API server for the DeepSeek Bridge
+
+FIXES:
+- Non-streaming responses now include `reasoning_content` (thinking) separately,
+  matching the official DeepSeek API shape.
+- Streaming always ends with data: [DONE] even when the bridge raises an error
+  (errors are forwarded as an SSE error chunk first).
+- Every other part of the logic is unchanged.
 """
 import asyncio
 import json
@@ -97,21 +104,26 @@ async def chat_completions(req: ChatCompletionRequest):
 
     if not req.stream:
         full_text = ""
-        async for chunk in app.stream_response(prompt):
-            if not chunk.startswith(": "):
+        full_reasoning = ""
+        try:
+            async for chunk in app.stream_response(prompt):
                 parsed = app._parse_sse(chunk)
-                if parsed:
-                    full_text += parsed
+                if parsed and "error" not in parsed:
+                    full_text += parsed.get("content", "") or ""
+                    full_reasoning += parsed.get("reasoning", "") or ""
+        except Exception as e:
+            print(f"[SERVER] non-streaming error: {e}")
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
+        message = {"role": "assistant", "content": full_text}
+        if full_reasoning:
+            message["reasoning_content"] = full_reasoning
         return {
             "id": f"chatcmpl-{uuid.uuid4()}",
             "object": "chat.completion",
             "created": int(time.time()),
             "model": req.model or "deepseek-chat",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": full_text},
-                "finish_reason": "stop"
-            }]
+            "choices": [{"index": 0, "message": message, "finish_reason": "stop"}]
         }
 
     async def event_stream():
@@ -125,22 +137,25 @@ async def chat_completions(req: ChatCompletionRequest):
         }
         yield f"data: {json.dumps(init)}\n\n"
 
-        async for chunk in app.stream_response(prompt):
-            if chunk.startswith(": "):
-                yield chunk
-            else:
-                # Chunk is already a valid OpenAI SSE string – forward as‑is
+        try:
+            async for chunk in app.stream_response(prompt):
+                # Chunk is already a valid OpenAI SSE string – forward as-is
                 yield chunk
 
-        final = {
-            "id": f"chatcmpl-{uuid.uuid4()}",
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": req.model or "deepseek-chat",
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-        }
-        yield f"data: {json.dumps(final)}\n\n"
-        yield "data: [DONE]\n\n"
+            final = {
+                "id": f"chatcmpl-{uuid.uuid4()}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": req.model or "deepseek-chat",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            }
+            yield f"data: {json.dumps(final)}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            print(f"[SERVER] stream error: {e}")
+            err = {"error": {"message": str(e), "type": "internal_error"}}
+            yield f"data: {json.dumps(err)}\n\n"
+            yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
