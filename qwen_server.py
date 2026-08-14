@@ -1,8 +1,9 @@
 """
-server.py – OpenAI-compatible API server for the DeepSeek Bridge
+qwen_server.py – OpenAI-compatible API server for the Qwen Bridge
 
-Runs on port 8000 by default. To change:  set DEEPSEEK_PORT env var, e.g.
-    DEEPSEEK_PORT=8010 python server.py
+Runs on port 8001 by default (DeepSeek server.py keeps port 8000).
+To change:  set QWEN_PORT env var, e.g.
+    QWEN_PORT=8020 python qwen_server.py
 """
 import asyncio
 import json
@@ -15,13 +16,13 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
 import uvicorn
-import app        # the DeepSeek bridge module (app.py)
+import qwen_app as app        # the Qwen bridge module (qwen_app.py)
 
 # ==================== Port ====================
-PORT = int(os.environ.get("DEEPSEEK_PORT", "8000"))
+PORT = int(os.environ.get("QWEN_PORT", "8001"))
 
 # ==================== FastAPI app ====================
-api = FastAPI(title="DeepSeek Bridge API")
+api = FastAPI(title="Qwen Bridge API")
 
 def extract_text(content: Any) -> str:
     if isinstance(content, str):
@@ -50,7 +51,7 @@ class StreamOptions(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     model_config = {"extra": "ignore"}
-    model: Optional[str] = "deepseek-chat"
+    model: Optional[str] = "qwen-auto"
     messages: list[Message]
     stream: bool = False
     temperature: Optional[float] = None
@@ -62,9 +63,10 @@ class ChatCompletionRequest(BaseModel):
 async def startup():
     await app.startup()
     print("\n" + "=" * 60)
-    print(f"  DeepSeek Bridge API running at http://127.0.0.1:{PORT}")
+    print(f"  Qwen Bridge API running at http://127.0.0.1:{PORT}")
     print("  Endpoint: POST /v1/chat/completions")
     print(f"  Base URL for agent: http://127.0.0.1:{PORT}/v1")
+    print("  Model: qwen-auto")
     print("=" * 60 + "\n")
 
 @api.on_event("shutdown")
@@ -77,10 +79,10 @@ async def list_models():
     return {
         "object": "list",
         "data": [{
-            "id": "deepseek-chat",
+            "id": "qwen-auto",
             "object": "model",
             "created": 1700000000,
-            "owned_by": "deepseek-bridge"
+            "owned_by": "qwen-bridge"
         }]
     }
 
@@ -122,7 +124,7 @@ async def chat_completions(req: ChatCompletionRequest):
             "id": f"chatcmpl-{uuid.uuid4()}",
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": req.model or "deepseek-chat",
+            "model": req.model or "qwen-auto",
             "choices": [{"index": 0, "message": message, "finish_reason": "stop"}]
         }
 
@@ -132,7 +134,7 @@ async def chat_completions(req: ChatCompletionRequest):
             "id": f"chatcmpl-{uuid.uuid4()}",
             "object": "chat.completion.chunk",
             "created": int(time.time()),
-            "model": req.model or "deepseek-chat",
+            "model": req.model or "qwen-auto",
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
         }
         yield f"data: {json.dumps(init)}\n\n"
@@ -146,7 +148,7 @@ async def chat_completions(req: ChatCompletionRequest):
                 "id": f"chatcmpl-{uuid.uuid4()}",
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
-                "model": req.model or "deepseek-chat",
+                "model": req.model or "qwen-auto",
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
             }
             yield f"data: {json.dumps(final)}\n\n"

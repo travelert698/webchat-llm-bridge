@@ -1,17 +1,40 @@
-# Python virtual environments
+# ==================== Python ====================
+# Virtual environments
 venv/
 .venv/
 env/
 ENV/
 
-# Browser data folders
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment files (secrets / local config)
+.env
+.env.*
+!.env.example
+
+# ==================== This project (bridges) ====================
+# Browser login profiles (contain live session cookies - NEVER commit)
 browser_data/
 .browser_data/
+qwen_browser_data/
+.qwen_browser_data/
 
-# IDE and OS files 
+# Raw SSE debug dumps (contain prompt + AI reply content - NEVER commit)
+deepseek_stream_dump.jsonl
+qwen_stream_dump.jsonl
+*_stream_dump.jsonl
+
+# Logs
+*.log
+
+# ==================== IDE / OS ====================
 .vscode/
 .idea/
-__pycache__/
-*.pyc
 .DS_Store
 Thumbs.db

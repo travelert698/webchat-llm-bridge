@@ -1,26 +1,28 @@
 """
-app.py – DeepSeek Bridge (route interception + human idle + clean API output)
+qwen_app.py – Qwen AI Bridge (route interception + human idle + clean API output)
 
-FIXED v3. What changed in this version:
-1. STATUS LEAK FIXED         -> {"v": "FINISHED"} / {"v": "CONTENT_FILTER"} (status
-   payloads) are NEVER emitted as content. A string value is only treated as text
-   when the payload has NO path (p is None) — exactly like the reference driver.
-2. INLINE FIRST-FRAGMENT      -> DeepSeek sometimes sends the first fragment inline in
-   the opening payload: {"v": {"response": {"fragments": [...]}}}. That shape is now
-   converted into a normal APPEND op so the THINK type is registered.
-3. FRAGMENT TYPES BY INDEX    -> both path styles are resolved:
-   "response/fragments/0/content" (index at [2]) and "fragments/0/content" (index at [1]).
-   Unknown index falls back to the most recently appended fragment type (active type),
-   like the reference driver's _stream_active_fragment_type.
-4. THINKING -> delta.reasoning_content  -> this is exactly what Continue's
-   fromChatCompletionChunk() maps to { role: "thinking" } and renders as a separate
-   thinking block (verified against continuedev/continue PR #6236 + issue #11069).
-   Set SEND_THINKING = False to drop thinking entirely.
-5. DEBUG_DUMP                -> set DEBUG_DUMP = True to write every raw SSE data line
-   to deepseek_stream_dump.jsonl.
-6. INCREMENTAL UTF-8 DECODER -> no more "�" from split multi-byte characters.
-7. TAIL LINE FLUSHED, CLIENT-DISCONNECT ABORT, IDLE SIMULATION FIX, 300s TIMEOUT
-   (unchanged from v2).
+Same architecture as the DeepSeek app.py bridge. The flow:
+  1. User runs qwen_server.py -> a real browser opens chat.qwen.ai (persistent profile).
+  2. User logs in manually once (phone/email login) -> session cookie saved.
+  3. Continue (or any OpenAI client) sends a request to /v1/chat/completions.
+  4. The prompt is typed into the Qwen textarea and sent like a human (with
+     random typing delay + idle mouse/scroll simulation).
+  5. Playwright intercepts the browser's OWN POST to the Qwen backend completion
+     API:  POST https://chat.qwen.ai/api/v2/chat/completions
+  6. The exact request is re-issued with httpx as a real streaming call; bytes
+     arrive live from Qwen's SSE stream.
+  7. The parser converts each SSE payload into OpenAI-compatible chunks:
+       - phase="thinking_summary"  -> delta.reasoning_content (Continue shows it
+         as a separate thinking block)
+       - phase="answer"            -> delta.content (the final answer)
+       - phase="web_search"/tools  -> ignored
+  8. Chunks stream to the client; the full captured body is replayed into the
+     page (route.fulfill) so the on-screen chat completes normally.
+
+Selectors verified from the live Qwen page:
+  INPUT  -> <textarea class="message-input-textarea" placeholder="Ask Qwen">
+  SEND   -> <div class="chat-prompt-send-button"><button class="send-button"
+            aria-label="Send">
 """
 import asyncio
 import codecs
@@ -36,15 +38,17 @@ page = None
 process_lock = asyncio.Lock()
 _route_registered = False
 
-DEEPSEEK_URL = "https://chat.deepseek.com"
-USER_DATA_DIR = "./browser_data"
-INPUT_SELECTOR = 'textarea[placeholder="Message DeepSeek"]'
-COMPLETION_GLOB = "**/api/v0/chat/completion"
-REGENERATE_GLOB = "**/api/v0/chat/regenerate"
+QWEN_URL = "https://chat.qwen.ai"
+USER_DATA_DIR = "./qwen_browser_data"
+INPUT_SELECTOR = "textarea.message-input-textarea"
+INPUT_FALLBACK_SELECTOR = 'textarea[placeholder="Ask Qwen"]'
+SEND_SELECTOR = "div.chat-prompt-send-button button"
+SEND_FALLBACK_SELECTOR = "button[aria-label='Send']"
+COMPLETION_GLOB = "**/api/v2/chat/completions*"
 STREAM_TIMEOUT_S = 300.0
 SEND_THINKING = True     # True -> thinking streamed as delta.reasoning_content
 DEBUG_DUMP = False       # True -> write raw SSE data lines to DUMP_FILE
-DUMP_FILE = "deepseek_stream_dump.jsonl"
+DUMP_FILE = "qwen_stream_dump.jsonl"
 
 # Per-turn route state
 _armed = asyncio.Event()
@@ -55,8 +59,8 @@ _idle_task: asyncio.Task | None = None
 _abort_event: asyncio.Event | None = None
 _intercepted_response = None
 _send_signature: str | None = None
-_fragment_types: list[str] = []
-_active_fragment_type: str | None = None
+_thinking_emitted: str = ""   # incremental tracking for repeated summary payloads
+_stream_error: bool = False   # once an error payload arrives, stop processing
 
 # ==================== Browser Setup ====================
 async def startup():
@@ -66,10 +70,10 @@ async def startup():
         user_data_dir=USER_DATA_DIR, headless=False
     )
     page = browser.pages[0] if browser.pages else await browser.new_page()
-    await page.goto(DEEPSEEK_URL)
+    await page.goto(QWEN_URL)
 
-    print("\nPlease log in manually, then press Enter in the terminal...")
-    await asyncio.to_thread(input)          # don't block the event loop
+    print("\nPlease log in manually (Qwen login: phone/email), then press Enter in the terminal...")
+    await asyncio.to_thread(input)
     print("Logged in. Registering route handler...")
 
     await _register_route()
@@ -81,16 +85,12 @@ async def shutdown():
         await browser.close()
         print("Browser closed.")
 
-# ==================== Fast paste + send ====================
-SEND_SELECTOR = (
-    "[role='button'].ds-button._52c986b:visible, "
-    ".ds-button._52c986b.ds-button--circle:visible, "
-    "div.ds-icon-button._52c986b:visible"
-)
-
+# ==================== Human-like paste + send ====================
 async def paste_and_send(text: str):
     global page
     input_element = page.locator(INPUT_SELECTOR)
+    if await input_element.count() == 0:
+        input_element = page.locator(INPUT_FALLBACK_SELECTOR)
     await input_element.click()
     await input_element.fill("")
     await input_element.fill(text)
@@ -98,10 +98,16 @@ async def paste_and_send(text: str):
     await _remember_send_signature()
     await page.keyboard.press("Enter")
 
+async def _locate_send_button():
+    btn = page.locator(SEND_SELECTOR).first
+    if await btn.count() == 0:
+        btn = page.locator(SEND_FALLBACK_SELECTOR).first
+    return btn
+
 async def _remember_send_signature():
     global _send_signature
     try:
-        btn = page.locator(SEND_SELECTOR).first
+        btn = await _locate_send_button()
         if await btn.count() == 0:
             return
         _send_signature = await btn.evaluate(
@@ -113,7 +119,7 @@ async def _remember_send_signature():
 async def _click_stop_button():
     """Click the Stop button (the Send control swaps to Stop while generating)."""
     try:
-        btn = page.locator(SEND_SELECTOR).first
+        btn = await _locate_send_button()
         if await btn.count() == 0:
             return
         signature = await btn.evaluate(
@@ -148,134 +154,93 @@ async def idle_actions(stop_event: asyncio.Event):
             pass
         await asyncio.sleep(random.uniform(1.5, 4.0))
 
-# ==================== Stream parsing ====================
-def _expand_relative_ops(v, base):
-    """Expand BATCH op lists: ops with relative paths get the base path prefixed."""
-    out = []
-    for item in v:
-        if not isinstance(item, dict):
-            continue
-        item = dict(item)
-        item_p = str(item.get("p") or "")
-        if base and item_p and not item_p.startswith("response/") and not item_p.startswith("fragments/"):
-            item["p"] = f"{base}/{item_p}"
-        out.append(item)
-    return out
+# ==================== Qwen stream parsing ====================
+def _extract_qwen_summary_parts(extra: dict, key: str) -> list[str]:
+    value = extra.get(key)
+    if isinstance(value, list):
+        return [str(x) for x in value if str(x).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value]
+    return []
+
+def _extract_thinking_summary(delta: dict) -> str:
+    """Join delta.extra.summary_title[] / summary_thought[] like the reference driver."""
+    extra = delta.get("extra")
+    if not isinstance(extra, dict):
+        return ""
+    titles = _extract_qwen_summary_parts(extra, "summary_title")
+    thoughts = _extract_qwen_summary_parts(extra, "summary_thought")
+    section_count = max(len(titles), len(thoughts))
+    sections: list[str] = []
+    for idx in range(section_count):
+        title = titles[idx] if idx < len(titles) else ""
+        thought = thoughts[idx] if idx < len(thoughts) else ""
+        if title and thought:
+            sections.append(f"{title}\n{thought}")
+        elif title or thought:
+            sections.append(title or thought)
+    return "\n\n".join(s for s in sections if s)
 
 def _handle_payload(obj: dict, queue) -> None:
-    """Process one DeepSeek SSE payload into a list of ops, then interpret them.
+    """Process one Qwen SSE payload: {"choices": [{"delta": {...}}]}."""
+    global _thinking_emitted, _stream_error
 
-    Handles every shape the reference driver (IntenseRP) handles:
-      - single op:            {"p": ..., "o": ..., "v": ...}
-      - BATCH op list:        {"p": "response", "o": "BATCH", "v": [op, op, ...]}
-      - direct content:       {"v": "text"}                       (p is None)
-      - inline first fragment:{"v": {"response": {"fragments": [...]}}}
-    """
-    p = obj.get("p")
-    o = obj.get("o")
-    v = obj.get("v")
+    if _stream_error:
+        return   # an error already occurred; ignore everything after it
 
-    if "v" not in obj:
+    # Provider-side error payloads
+    if "error" in obj:
+        err = obj["error"]
+        msg = err.get("message", "Qwen stream error") if isinstance(err, dict) else str(err)
+        queue.put_nowait(_make_error_sse(str(msg)))
+        _stream_error = True
         return
 
-    # Case 1: batch update, direct content, or inline fragment payload
-    if p is None or (p == "response" and o == "BATCH"):
-        if isinstance(v, list) and v and all(isinstance(x, dict) and "p" in x for x in v):
-            ops = _expand_relative_ops(v, base=p)
-        elif isinstance(v, str):
-            # Direct content update (rare DeepSeek quirk) — attribute to active fragment
-            _emit_text(v, _active_fragment_type, queue)
+    choices = obj.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return
+    choice0 = choices[0]
+    if not isinstance(choice0, dict):
+        return
+    delta = choice0.get("delta")
+    if not isinstance(delta, dict):
+        return
+
+    phase = str(delta.get("phase") or "").strip().lower()
+    role = str(delta.get("role") or "").strip().lower()
+    status = str(delta.get("status") or "").strip().lower()
+
+    # Ignore tool-call chatter + raw search results for stability
+    if (phase == "web_search"
+            or role == "function"
+            or delta.get("function_call") is not None
+            or delta.get("tool_calls") is not None):
+        return
+
+    if phase == "thinking_summary":
+        summary_text = _extract_thinking_summary(delta)
+        if not summary_text:
             return
-        elif isinstance(v, dict):
-            # Opening payload: DeepSeek sometimes inlines the first fragment here
-            response_obj = v.get("response", v)
-            if isinstance(response_obj, dict):
-                fragments = response_obj.get("fragments")
-                if isinstance(fragments, list) and fragments:
-                    ops = [{"p": "response/fragments", "o": "APPEND", "v": fragments}]
-            else:
-                return
-        else:
-            return
-
-    # Case 2: single path-based update (or op list under a path)
-    else:
-        if isinstance(v, list) and v and all(isinstance(x, dict) and "p" in x for x in v):
-            ops = _expand_relative_ops(v, base=p) or [{"p": p, "o": o, "v": v}]
-        else:
-            ops = [{"p": p, "o": o, "v": v}]
-
-    for op in ops:
-        if not isinstance(op, dict):
-            continue
-        _handle_op(op.get("p"), op.get("o"), op.get("v"), queue)
-
-def _handle_op(p, o, v, queue) -> None:
-    global _active_fragment_type
-
-    # Status updates (FINISHED / CONTENT_FILTER / ...) — NEVER content
-    if p in ("status", "response/status"):
-        return
-
-    # Fragment append: record type by index, emit any inline content
-    if isinstance(p, str) and (p == "fragments" or p == "response/fragments"
-                               or p.endswith("/fragments")) and o == "APPEND" and isinstance(v, list):
-        for frag in v:
-            if isinstance(frag, dict):
-                ftype = str(frag.get("type") or "").upper()
-                _fragment_types.append(ftype)
-                _active_fragment_type = ftype
-                if "content" in frag:
-                    _emit_text(str(frag.get("content") or ""), ftype, queue)
-        return
-
-    # Fragment content delta: response/fragments/0/content  OR  fragments/0/content
-    if (isinstance(p, str)
-            and (p.startswith("response/fragments/") or p.startswith("fragments/"))
-            and p.endswith("/content")):
-        _emit_text(str(v or ""), _type_for_path(p), queue)
-        return
-
-    # Fragment status paths, search ops, tool ops, etc. — nothing to emit
-    return
-
-def _type_for_path(p: str) -> str | None:
-    """Resolve the fragment type for a content path, by fragment index."""
-    try:
-        parts = p.split("/")
-        if len(parts) >= 4 and parts[0] == "response" and parts[1] == "fragments":
-            idx = int(parts[2])                      # response/fragments/0/content
-        elif len(parts) >= 3 and parts[0] == "fragments":
-            idx = int(parts[1])                      # fragments/0/content
-        else:
-            return _active_fragment_type
-    except (ValueError, IndexError):
-        return _active_fragment_type
-
-    if 0 <= idx < len(_fragment_types):
-        return _fragment_types[idx]
-    return _active_fragment_type                     # fallback to active type
-
-def _emit_text(text, ftype, queue) -> None:
-    if not text:
-        return
-    ftype = (ftype or "").upper()
-    if ftype == "THINK":
         if SEND_THINKING:
-            queue.put_nowait(_make_openai_reasoning_sse(text))
+            # Qwen repeats the whole summary each event; emit only the missing suffix
+            if summary_text.startswith(_thinking_emitted):
+                missing = summary_text[len(_thinking_emitted):]
+            else:
+                missing = summary_text
+            if missing:
+                queue.put_nowait(_make_openai_reasoning_sse(missing))
+                _thinking_emitted += missing
         return
-    if ftype in ("SEARCH", "TOOL_SEARCH"):
-        return
-    queue.put_nowait(_make_openai_sse(text))         # RESPONSE / unknown -> answer
 
-def _dump_line(data: str) -> None:
-    if not DEBUG_DUMP:
+    if phase == "answer":
+        content = delta.get("content")
+        if isinstance(content, str) and content:
+            queue.put_nowait(_make_openai_sse(content))
+        if status == "finished":
+            queue.put_nowait(_make_openai_finish_sse())
         return
-    try:
-        with open(DUMP_FILE, "a", encoding="utf-8") as f:
-            f.write(data + "\n")
-    except Exception:
-        pass
+
+    # Unknown phases: ignore
 
 # ==================== Route handler (registered once) ====================
 async def _register_route():
@@ -336,7 +301,8 @@ async def _register_route():
                             if data == "[DONE]":
                                 done_seen = True
                                 break
-                            _dump_line(data)
+                            if DEBUG_DUMP:
+                                _dump_line(data)
                             try:
                                 obj = json.loads(data)
                                 _handle_payload(obj, _current_queue)
@@ -352,14 +318,15 @@ async def _register_route():
                         if tail.startswith("data:"):
                             data = tail[5:].strip()
                             if data and data != "[DONE]":
-                                _dump_line(data)
+                                if DEBUG_DUMP:
+                                    _dump_line(data)
                                 try:
                                     obj = json.loads(data)
                                     _handle_payload(obj, _current_queue)
                                 except Exception:
                                     pass
         except Exception as e:
-            print(f"[Bridge] Interception error: {e}")
+            print(f"[Qwen Bridge] Interception error: {e}")
             if _current_queue is not None:
                 await _current_queue.put(_make_error_sse(f"Interception error: {e}"))
         finally:
@@ -378,19 +345,18 @@ async def _register_route():
             await route.fulfill(body=bytes(full_body), status=response_status, headers=resp_headers)
 
     await page.route(COMPLETION_GLOB, handle_route)
-    await page.route(REGENERATE_GLOB, handle_route)
     _route_registered = True
 
-# ==================== stream_response (called by server.py) ====================
+# ==================== stream_response (called by qwen_server.py) ====================
 async def stream_response(prompt: str):
     global _current_queue, _armed, _intercepted, _idle_task, _abort_event
-    global _fragment_types, _active_fragment_type
+    global _thinking_emitted, _stream_error
     async with process_lock:
         _current_queue = asyncio.Queue()
         _intercepted = False
         _abort_event = asyncio.Event()
-        _fragment_types = []
-        _active_fragment_type = None
+        _thinking_emitted = ""
+        _stream_error = False
         _armed.set()
 
         idle_stop = asyncio.Event()
@@ -426,7 +392,7 @@ async def stream_response(prompt: str):
             await _abort_provider_stream()
             raise
         except Exception as e:
-            print(f"[Bridge] stream_response error: {e}")
+            print(f"[Qwen Bridge] stream_response error: {e}")
             await _abort_provider_stream()
             raise
         finally:
@@ -450,7 +416,7 @@ async def _abort_provider_stream():
             pass
 
 # ==================== SSE helpers ====================
-def _make_openai_sse(text: str, model: str = "deepseek-chat") -> str:
+def _make_openai_sse(text: str, model: str = "qwen-auto") -> str:
     payload = {
         "id": "chatcmpl-" + str(int(time.time() * 1000)),
         "object": "chat.completion.chunk",
@@ -460,16 +426,24 @@ def _make_openai_sse(text: str, model: str = "deepseek-chat") -> str:
     }
     return f"data: {json.dumps(payload)}\n\n"
 
-def _make_openai_reasoning_sse(text: str, model: str = "deepseek-chat") -> str:
-    """Thinking chunk — uses delta.reasoning_content. Verified: Continue's
-    fromChatCompletionChunk() maps reasoning_content -> { role: "thinking" } and
-    renders it as a separate thinking block (continuedev/continue PR #6236)."""
+def _make_openai_reasoning_sse(text: str, model: str = "qwen-auto") -> str:
+    """Thinking chunk — delta.reasoning_content (Continue renders it as thinking)."""
     payload = {
         "id": "chatcmpl-" + str(int(time.time() * 1000)),
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model,
         "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": None}]
+    }
+    return f"data: {json.dumps(payload)}\n\n"
+
+def _make_openai_finish_sse(model: str = "qwen-auto") -> str:
+    payload = {
+        "id": "chatcmpl-" + str(int(time.time() * 1000)),
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
     }
     return f"data: {json.dumps(payload)}\n\n"
 
@@ -497,3 +471,10 @@ def _parse_sse(sse_string: str) -> dict | None:
         "content": delta.get("content", "") or "",
         "reasoning": delta.get("reasoning_content", "") or "",
     }
+
+def _dump_line(data: str) -> None:
+    try:
+        with open(DUMP_FILE, "a", encoding="utf-8") as f:
+            f.write(data + "\n")
+    except Exception:
+        pass
