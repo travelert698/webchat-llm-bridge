@@ -30,7 +30,7 @@ import json
 import random
 import time
 import httpx
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 # ==================== Globals ====================
 browser = None
@@ -63,6 +63,38 @@ _thinking_emitted: str = ""   # incremental tracking for repeated summary payloa
 _stream_error: bool = False   # once an error payload arrives, stop processing
 
 # ==================== Browser Setup ====================
+# --- Loading-glitch hardening (same fix as app.py) ---
+# Navigate with wait_until="domcontentloaded" (never "load"/"networkidle")
+# and give every Playwright wait a generous 15 s ceiling.
+NAV_TIMEOUT_MS = 15_000          # safe ceiling for goto / clicks / fills
+GOTO_WAIT_UNTIL = "domcontentloaded"
+
+async def _goto_chat_page(page, url: str):
+    """page.goto() that survives endless-spinner glitches: waits for DOM
+    readiness only, retries once on timeout, and never crashes at startup."""
+    for attempt in (1, 2):
+        try:
+            await page.goto(
+                url,
+                wait_until=GOTO_WAIT_UNTIL,   # DOM ready only – NOT "load"/"networkidle"
+                timeout=NAV_TIMEOUT_MS,       # 15 s instead of 3 s
+            )
+            return
+        except PlaywrightTimeoutError:
+            if attempt == 1:
+                print("[startup] navigation timed out (spinner glitch?) – retrying...")
+            else:
+                print(f"[startup] {url} still not settling – continuing anyway.")
+
+async def _wait_for_input_ready(page, timeout_s: int = 60):
+    """Wait until the chat textarea exists in the DOM (best effort, never raises)."""
+    try:
+        await page.wait_for_selector(
+            INPUT_SELECTOR, state="attached", timeout=timeout_s * 1000
+        )
+    except Exception:
+        print("[startup] chat input not detected yet – continuing anyway.")
+
 async def startup():
     global browser, page
     p = await async_playwright().start()
@@ -70,7 +102,13 @@ async def startup():
         user_data_dir=USER_DATA_DIR, headless=False
     )
     page = browser.pages[0] if browser.pages else await browser.new_page()
-    await page.goto(QWEN_URL)
+
+    # Raise the default ceiling for EVERY action/navigation on this page.
+    page.set_default_timeout(NAV_TIMEOUT_MS)
+    page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+
+    await _goto_chat_page(page, QWEN_URL)       # domcontentloaded + retry
+    await _wait_for_input_ready(page)           # tolerant of the spinner
 
     print("\nPlease log in manually (Qwen login: phone/email), then press Enter in the terminal...")
     await asyncio.to_thread(input)

@@ -28,7 +28,7 @@ import json
 import random
 import time
 import httpx
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 # ==================== Globals ====================
 browser = None
@@ -59,6 +59,46 @@ _fragment_types: list[str] = []
 _active_fragment_type: str | None = None
 
 # ==================== Browser Setup ====================
+# --- Loading-glitch hardening (DeepSeek "Into the Unknown" spinner) ---
+# During server overload the tab keeps spinning and the "load" event never
+# fires, even though the DOM (chat textarea) is already usable. So we:
+#   * navigate with wait_until="domcontentloaded"  (never "load"/"networkidle")
+#   * raise every Playwright wait ceiling to 15 s  (instead of failing at 3 s)
+NAV_TIMEOUT_MS = 15_000          # safe ceiling for goto / clicks / fills
+GOTO_WAIT_UNTIL = "domcontentloaded"
+
+async def _goto_chat_page(page, url: str):
+    """page.goto() that survives the endless-spinner glitch: waits for DOM
+    readiness only, retries once on timeout, and never crashes at startup."""
+    for attempt in (1, 2):
+        try:
+            await page.goto(
+                url,
+                wait_until=GOTO_WAIT_UNTIL,   # DOM ready only – NOT "load"/"networkidle"
+                timeout=NAV_TIMEOUT_MS,       # 15 s instead of 3 s
+            )
+            return
+        except PlaywrightTimeoutError:
+            if attempt == 1:
+                print("[startup] navigation timed out (spinner glitch?) – retrying...")
+            else:
+                # Even DOM-ready didn't settle. Continue anyway: the login
+                # prompt below still runs and route registration is independent.
+                print(f"[startup] {url} still not settling – continuing anyway.")
+
+async def _wait_for_input_ready(page, timeout_s: int = 60):
+    """Wait until the chat textarea exists in the DOM (best effort).
+
+    state='attached' on purpose: DeepSeek renders the editor before the
+    network settles, so a still-spinning tab must not block the bridge.
+    Never raises."""
+    try:
+        await page.wait_for_selector(
+            INPUT_SELECTOR, state="attached", timeout=timeout_s * 1000
+        )
+    except Exception:
+        print("[startup] chat input not detected yet – continuing anyway.")
+
 async def startup():
     global browser, page
     p = await async_playwright().start()
@@ -66,7 +106,14 @@ async def startup():
         user_data_dir=USER_DATA_DIR, headless=False
     )
     page = browser.pages[0] if browser.pages else await browser.new_page()
-    await page.goto(DEEPSEEK_URL)
+
+    # Raise the default ceiling for EVERY action/navigation on this page
+    # (replaces any hard-coded 3000 ms and Playwright's 30 s default).
+    page.set_default_timeout(NAV_TIMEOUT_MS)
+    page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+
+    await _goto_chat_page(page, DEEPSEEK_URL)   # domcontentloaded + retry
+    await _wait_for_input_ready(page)           # tolerant of the spinner
 
     print("\nPlease log in manually, then press Enter in the terminal...")
     await asyncio.to_thread(input)          # don't block the event loop
