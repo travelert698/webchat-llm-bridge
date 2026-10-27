@@ -20,19 +20,37 @@ Install updated dependencies after replacing the files:
 python -m pip install -r requirements.txt
 ```
 
-## Run the bridge
+## Run the bridge and configure the queue
 
-Start the backend server in one terminal. Use `PROMPT_MODE=full` so it includes the full conversation:
+Start either server in a console. By default it asks for the prompt mode first, then asks for a positive provider-submission limit per minute (Enter accepts the conservative default of 5):
+
+```powershell
+python server.py       # DeepSeek, port 8000
+# or
+python qwen_server.py  # Qwen, port 8001
+```
+
+The RPM value paces **outbound browser-backed model submissions**, not just client HTTP requests. Each tool-call repair attempt also counts. The prompt is a local safety setting; it cannot discover or override the provider's own web-chat limits.
+
+For non-interactive launches, set environment variables instead. On an interactive terminal, valid environment values prefill the prompts; the console still asks unless a supervisor has already chosen the settings. Provider-specific values take precedence over `BRIDGE_RPM` and `RATE_LIMIT_RPM`:
 
 ```powershell
 # DeepSeek
-$env:PROMPT_MODE = 'full'
+$env:PROMPT_MODE = 'full'       # or 'user_only'
+$env:DEEPSEEK_RPM = '5'
 python server.py
 
-# Or Qwen, in a separate run
+# Qwen
 $env:PROMPT_MODE = 'full'
+$env:QWEN_RPM = '5'
 python qwen_server.py
 ```
+
+The client queue is on by default. Each server runs one browser-backed generation at a time in FIFO order, then paces provider starts against a rolling 60-second window without a startup burst. By default, up to 100 additional generation requests may wait; change this with `DEEPSEEK_MAX_QUEUE`, `QWEN_MAX_QUEUE`, or the shared `BRIDGE_MAX_QUEUE` environment variable. `GET /queue/status` reports queue depth and recent provider starts.
+
+No finite machine can safely hold an unlimited backlog. If all pending slots are occupied, the bridge returns a structured HTTP 429 `queue_full` response instead of growing memory without bound or crashing. Clients should back off before retrying; while the process remains up, accepted requests stay queued rather than being silently discarded. The in-memory queue is not durable: a process crash/restart can interrupt queued work. The cap is configurable from 1 to 10,000 pending requests.
+
+`run_both.py` asks for the prompt mode and independent DeepSeek/Qwen RPM values in its own console, then passes those settings to each child process. This avoids two child processes racing to read the same terminal input.
 
 Start Claude Code in a second terminal with the base URL set to the server root (do not append `/v1`):
 
@@ -54,6 +72,7 @@ The DeepSeek/Qwen bridges open a visible browser and wait for manual login. Brow
 - Qwen: `POST http://127.0.0.1:8001/v1/messages`, optional `/v1/messages/count_tokens`.
 - Existing OpenAI route remains `POST /v1/chat/completions` on both servers.
 - `GET` and `HEAD /api/hello` are lightweight client connectivity probes; `/health` remains available.
+- `GET /queue/status` reports FIFO queue depth, active request time, RPM pacing, and local counters.
 
 ## Tool-calling model and limitations
 

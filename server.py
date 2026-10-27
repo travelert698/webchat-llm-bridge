@@ -1,8 +1,10 @@
 """
 server.py – OpenAI-compatible API server for the DeepSeek Bridge
 
-Runs on port 8000 by default. To change:  set DEEPSEEK_PORT env var, e.g.
+Runs on port 8000 by default. To change: set DEEPSEEK_PORT env var, e.g.
     DEEPSEEK_PORT=8010 python server.py
+Interactive startup asks for prompt mode, then a provider-submission RPM limit.
+Generation requests are queued FIFO; see /queue/status for queue statistics.
 
 Exposes the existing OpenAI-compatible Chat Completions API and a minimum
 Anthropic Messages adapter for Claude Code/custom Anthropic-format clients.
@@ -27,33 +29,35 @@ from anthropic_compat import (
     handle_count_tokens,
     handle_messages,
 )
+from request_queue import RequestQueue, RequestQueueMiddleware
+from startup_config import choose_startup_config
 
-# ==================== Port ====================
+# ==================== Port and startup configuration ====================
 PORT = int(os.environ.get("DEEPSEEK_PORT", "8000"))
-
-# ==================== Prompt mode (asked at startup) ====================
-# "full"      -> system + ALL messages (roles labelled) — works with both
-#                Continue.dev and DeepSeek Harness
-# "user_only" -> ONLY the last user message — also works with both agents
-def _choose_prompt_mode() -> str:
-    env = os.environ.get("PROMPT_MODE", "").strip().lower()
-    if env in ("full", "user_only"):
-        return env
-    try:
-        print("\n=== Prompt mode selection ===")
-        print("  [1] FULL passthrough (system + all messages)")
-        print("  [2] USER message only")
-        print("  (Both modes work with Continue.dev AND DeepSeek Harness.)")
-        choice = input("Enter 1 or 2 [default 1]: ").strip()
-        return "user_only" if choice == "2" else "full"
-    except Exception:
-        return "full"
-
-PROMPT_MODE = _choose_prompt_mode()
+PROMPT_MODE, RATE_LIMIT_RPM, MAX_PENDING_REQUESTS = choose_startup_config("deepseek")
 tool_bridge.PROMPT_MODE = PROMPT_MODE   # sync the global tool-bridge mode
+
+# ==================== Bounded client queue + provider pacing ====================
+REQUEST_QUEUE = RequestQueue(
+    requests_per_minute=RATE_LIMIT_RPM,
+    max_pending=MAX_PENDING_REQUESTS,
+)
+_original_stream_response = app.stream_response
+
+
+async def _rate_limited_stream_response(prompt: str):
+    """Gate every underlying web-model submission, including tool retries."""
+    await REQUEST_QUEUE.wait_for_provider_start()
+    async for chunk in _original_stream_response(prompt):
+        yield chunk
+
+
+# All plain chat, tool-bridge, and Anthropic adapter calls share this wrapper.
+app.stream_response = _rate_limited_stream_response
 
 # ==================== FastAPI app ====================
 api = FastAPI(title="DeepSeek Bridge API")
+api.add_middleware(RequestQueueMiddleware, queue=REQUEST_QUEUE)
 
 def extract_text(content: Any) -> str:
     """Extract plain text from OpenAI-style content (str or list of parts),
@@ -116,6 +120,9 @@ async def startup():
     print(f"  Claude Code base URL: http://127.0.0.1:{PORT}")
     print("  Mode: full passthrough + tool calling (tool_bridge.py)")
     print(f"  Prompt mode: {PROMPT_MODE}")
+    print(f"  Provider submission limit: {RATE_LIMIT_RPM} per rolling minute (smoothed)")
+    print(f"  FIFO client queue: 1 active + {MAX_PENDING_REQUESTS} waiting")
+    print("  Queue status: GET /queue/status")
     print("=" * 60 + "\n")
 
 @api.on_event("shutdown")
@@ -151,7 +158,15 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
                 },
             },
         )
-    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+    return JSONResponse(
+        status_code=422,
+        content={"error": {
+            "message": "Invalid request body.",
+            "type": "invalid_request_error",
+            "param": None,
+            "code": "validation_error",
+        }},
+    )
 
 # ==================== Chat completions ====================
 @api.post("/v1/chat/completions")
@@ -165,7 +180,15 @@ async def chat_completions(req: ChatCompletionRequest):
 
     if not req.messages:
         return JSONResponse(status_code=400, content={"error": "No messages provided."})
-    prompt = render_messages(req.messages)
+    try:
+        prompt = render_messages(req.messages)
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "Invalid or unsupported message content; this bridge accepts text-only input.",
+            "type": "invalid_request_error",
+            "param": "messages",
+            "code": "unsupported_content",
+        }})
     if not prompt.strip():
         return JSONResponse(status_code=400, content={"error": "Empty message."})
 
@@ -175,12 +198,24 @@ async def chat_completions(req: ChatCompletionRequest):
         try:
             async for chunk in app.stream_response(prompt):
                 parsed = app._parse_sse(chunk)
-                if parsed and "error" not in parsed:
+                if parsed and "error" in parsed:
+                    return JSONResponse(status_code=502, content={"error": {
+                        "message": str(parsed["error"]),
+                        "type": "upstream_error",
+                        "param": None,
+                        "code": "provider_error",
+                    }})
+                if parsed:
                     full_text += parsed.get("content", "") or ""
                     full_reasoning += parsed.get("reasoning", "") or ""
         except Exception as e:
-            print(f"[SERVER] non-streaming error: {e}")
-            return JSONResponse(status_code=500, content={"error": str(e)})
+            print(f"[SERVER] upstream request failed: {e}")
+            return JSONResponse(status_code=502, content={"error": {
+                "message": str(e),
+                "type": "upstream_error",
+                "param": None,
+                "code": "provider_error",
+            }})
 
         message = {"role": "assistant", "content": full_text}
         if full_reasoning:
@@ -194,33 +229,66 @@ async def chat_completions(req: ChatCompletionRequest):
         }
 
     async def event_stream():
+        response_id = f"chatcmpl-{uuid.uuid4()}"
+        created = int(time.time())
+        model = req.model or "deepseek-chat"
         yield ": connected\n\n"
         init = {
-            "id": f"chatcmpl-{uuid.uuid4()}",
+            "id": response_id,
             "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": req.model or "deepseek-chat",
+            "created": created,
+            "model": model,
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
         }
         yield f"data: {json.dumps(init)}\n\n"
 
         try:
             async for chunk in app.stream_response(prompt):
-                # Chunk is already a valid OpenAI SSE string – forward as-is
-                yield chunk
+                parsed = app._parse_sse(chunk)
+                if not parsed:
+                    if chunk.startswith(":"):
+                        yield chunk
+                    continue
+                if "error" in parsed:
+                    error = {"error": {
+                        "message": str(parsed["error"]),
+                        "type": "upstream_error",
+                        "code": "provider_error",
+                    }}
+                    yield f"data: {json.dumps(error)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                delta = {}
+                if parsed.get("content"):
+                    delta["content"] = parsed["content"]
+                if parsed.get("reasoning"):
+                    delta["reasoning_content"] = parsed["reasoning"]
+                if delta:
+                    item = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                    }
+                    yield f"data: {json.dumps(item)}\n\n"
 
             final = {
-                "id": f"chatcmpl-{uuid.uuid4()}",
+                "id": response_id,
                 "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": req.model or "deepseek-chat",
+                "created": created,
+                "model": model,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
             }
             yield f"data: {json.dumps(final)}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as e:
-            print(f"[SERVER] stream error: {e}")
-            err = {"error": {"message": str(e), "type": "internal_error"}}
+            print(f"[SERVER] upstream stream failed: {e}")
+            err = {"error": {
+                "message": str(e),
+                "type": "upstream_error",
+                "code": "provider_error",
+            }}
             yield f"data: {json.dumps(err)}\n\n"
             yield "data: [DONE]\n\n"
 
@@ -256,7 +324,12 @@ async def api_hello_head():
     return Response(status_code=200)
 
 
-# ==================== Health check ====================
+# ==================== Queue status and health ====================
+@api.get("/queue/status")
+async def queue_status():
+    return await REQUEST_QUEUE.snapshot()
+
+
 @api.get("/health")
 async def health():
     return {"status": "ok"}

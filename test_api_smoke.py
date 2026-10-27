@@ -12,6 +12,8 @@ import unittest
 import httpx
 
 os.environ.setdefault("PROMPT_MODE", "full")
+os.environ.setdefault("DEEPSEEK_RPM", "5")
+os.environ.setdefault("QWEN_RPM", "5")
 import server  # noqa: E402
 import qwen_server  # noqa: E402
 
@@ -46,6 +48,10 @@ async def _fake_stream_response(prompt: str):
         yield _openai_sse("fake reply")
 
 
+async def _fake_error_stream(prompt: str):
+    yield 'data: {"error":{"message":"synthetic provider failure","type":"internal_error"}}\n\n'
+
+
 class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.servers = [
@@ -62,7 +68,7 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
             bridge.stream_response = original
 
     async def test_messages_openai_and_tool_routes_for_both_servers(self):
-        for api, _, backend_model in self.servers:
+        for api, bridge, backend_model in self.servers:
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=api),
                 base_url="http://test",
@@ -97,6 +103,49 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
                 })
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual(response.json()["choices"][0]["message"]["content"], "fake reply")
+
+                queue_status = await client.get("/queue/status")
+                self.assertEqual(queue_status.status_code, 200, queue_status.text)
+                self.assertEqual(queue_status.json()["pending"], 0)
+                self.assertEqual(queue_status.json()["requests_per_minute"], 5)
+
+                invalid_content = await client.post("/v1/chat/completions", json={
+                    "messages": [{"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": "https://example.invalid/image.png"}}
+                    ]}],
+                })
+                self.assertEqual(invalid_content.status_code, 400, invalid_content.text)
+
+                invalid_body = await client.post("/v1/chat/completions", json={
+                    "messages": [{"role": "user", "content": "safe"}],
+                    "parallel_tool_calls": "sensitive-validation-marker",
+                })
+                self.assertEqual(invalid_body.status_code, 422, invalid_body.text)
+                self.assertNotIn("sensitive-validation-marker", invalid_body.text)
+
+                bridge.stream_response = _fake_error_stream
+                provider_error = await client.post("/v1/chat/completions", json={
+                    "model": backend_model,
+                    "messages": messages,
+                    "stream": False,
+                })
+                self.assertEqual(provider_error.status_code, 502, provider_error.text)
+                self.assertEqual(provider_error.json()["error"]["code"], "provider_error")
+
+                bridge.stream_response = _fake_stream_response
+                streaming = await client.post("/v1/chat/completions", json={
+                    "model": backend_model,
+                    "messages": messages,
+                    "stream": True,
+                })
+                self.assertEqual(streaming.status_code, 200, streaming.text)
+                chunks = [
+                    json.loads(line[6:]) for line in streaming.text.splitlines()
+                    if line.startswith("data: {")
+                ]
+                self.assertGreaterEqual(len(chunks), 3)
+                self.assertEqual(len({chunk["id"] for chunk in chunks}), 1)
+                self.assertIn("data: [DONE]", streaming.text)
 
                 response = await client.post("/v1/chat/completions", json={
                     "model": backend_model,

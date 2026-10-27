@@ -1,6 +1,109 @@
 # Complete copy/paste bundle — webchat-llm-bridge
 
-These are the complete changed runtime, test, and documentation files (not diffs). Copy each file to the same path in the project root. The ZIP also includes unchanged `app.py` and `qwen_app.py`; those browser/UI automation files are intentionally not reproduced in this text bundle.
+Complete runtime, test, and documentation files for the queue-enabled project. Copy each file to the same relative path in the project root. The ZIP also contains the unchanged browser/UI automation modules `app.py` and `qwen_app.py`, which are intentionally not duplicated in this bundle.
+
+## `.gitignore`
+
+````gitignore
+# ==================== Python ====================
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment files (secrets / local config)
+.env
+.env.*
+!.env.example
+
+# ==================== This project (bridges) ====================
+# Browser login profiles (contain live session cookies - NEVER commit)
+browser_data/
+.browser_data/
+qwen_browser_data/
+.qwen_browser_data/
+
+# Raw SSE debug dumps (contain prompt + AI reply content - NEVER commit)
+deepseek_stream_dump.jsonl
+qwen_stream_dump.jsonl
+*_stream_dump.jsonl
+
+# Logs
+*.log
+
+# ==================== IDE / OS ====================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+````
+
+## `README.md`
+
+````markdown
+# WebChat LLM Bridge
+
+A local OpenAI Chat Completions / minimal Anthropic Messages adapter for the existing **visible-browser** DeepSeek Web and Qwen Web automation. It preserves the browser/UI workflow; it is not a direct-provider-API client or a local model.
+
+## Quick start
+
+1. Install Python 3.10+ and the project dependencies:
+
+   ```powershell
+   python -m pip install -r requirements.txt
+   python -m playwright install chromium
+   ```
+
+2. Start one backend:
+
+   ```powershell
+   python server.py       # DeepSeek, default port 8000
+   # or
+   python qwen_server.py  # Qwen, default port 8001
+   ```
+
+3. In the console, choose prompt method **1** (full conversation) or **2** (last user message only). Then enter the local provider submissions-per-minute limit. Press Enter to use the conservative default of **5**. A visible browser opens; log in manually and confirm in the server console.
+
+4. Configure your client:
+
+   - DeepSeek OpenAI base URL: `http://127.0.0.1:8000/v1`
+   - Qwen OpenAI base URL: `http://127.0.0.1:8001/v1`
+   - Anthropic Messages base URL: the corresponding server root, without `/v1`
+
+For both backends, run `python run_both.py`; it asks for one prompt mode and separate DeepSeek/Qwen RPM values. Full setup, environment overrides, compatibility limits, and safety notes are in [`CLAUDE_CODE_SETUP.md`](CLAUDE_CODE_SETUP.md).
+
+## Queue and local rate limit
+
+The generation endpoints are FIFO-queued, one active browser-backed generation at a time. Every outbound model submission—including tool-repair attempts—is paced against the selected RPM. Up to 100 requests may wait by default; when full, the API returns a structured 429 instead of accumulating an unbounded backlog. Check `GET /queue/status` on either server.
+
+The value you enter is a **local pacing cap**, not an official provider quota. DeepSeek/Qwen web-chat limits can differ from their developer API quotas and may be unpublished or account-specific. The queue does not bypass throttling or provider controls. See [`QUEUE_RATE_LIMIT_RESEARCH.md`](QUEUE_RATE_LIMIT_RESEARCH.md).
+
+## Privacy and use
+
+The local APIs have no authentication and bind to loopback by default; do not expose them to a network. Prompts are sent through the provider website using your logged-in browser session. Keep browser profiles private, use non-sensitive test data, and retain the downstream tool approval policy. Provider compatibility and account-safety cannot be guaranteed.
+
+## Offline checks
+
+```powershell
+python test_parser.py
+python test_tool_bridge.py
+python test_anthropic_compat.py
+python test_api_smoke.py
+python test_request_queue.py
+python test_startup_config.py
+```
+
+The tests use fake streams and do not verify live logins, provider website behavior, or actual account-specific web limits.
+````
 
 ## `server.py`
 
@@ -8,8 +111,10 @@ These are the complete changed runtime, test, and documentation files (not diffs
 """
 server.py – OpenAI-compatible API server for the DeepSeek Bridge
 
-Runs on port 8000 by default. To change:  set DEEPSEEK_PORT env var, e.g.
+Runs on port 8000 by default. To change: set DEEPSEEK_PORT env var, e.g.
     DEEPSEEK_PORT=8010 python server.py
+Interactive startup asks for prompt mode, then a provider-submission RPM limit.
+Generation requests are queued FIFO; see /queue/status for queue statistics.
 
 Exposes the existing OpenAI-compatible Chat Completions API and a minimum
 Anthropic Messages adapter for Claude Code/custom Anthropic-format clients.
@@ -34,33 +139,35 @@ from anthropic_compat import (
     handle_count_tokens,
     handle_messages,
 )
+from request_queue import RequestQueue, RequestQueueMiddleware
+from startup_config import choose_startup_config
 
-# ==================== Port ====================
+# ==================== Port and startup configuration ====================
 PORT = int(os.environ.get("DEEPSEEK_PORT", "8000"))
-
-# ==================== Prompt mode (asked at startup) ====================
-# "full"      -> system + ALL messages (roles labelled) — works with both
-#                Continue.dev and DeepSeek Harness
-# "user_only" -> ONLY the last user message — also works with both agents
-def _choose_prompt_mode() -> str:
-    env = os.environ.get("PROMPT_MODE", "").strip().lower()
-    if env in ("full", "user_only"):
-        return env
-    try:
-        print("\n=== Prompt mode selection ===")
-        print("  [1] FULL passthrough (system + all messages)")
-        print("  [2] USER message only")
-        print("  (Both modes work with Continue.dev AND DeepSeek Harness.)")
-        choice = input("Enter 1 or 2 [default 1]: ").strip()
-        return "user_only" if choice == "2" else "full"
-    except Exception:
-        return "full"
-
-PROMPT_MODE = _choose_prompt_mode()
+PROMPT_MODE, RATE_LIMIT_RPM, MAX_PENDING_REQUESTS = choose_startup_config("deepseek")
 tool_bridge.PROMPT_MODE = PROMPT_MODE   # sync the global tool-bridge mode
+
+# ==================== Bounded client queue + provider pacing ====================
+REQUEST_QUEUE = RequestQueue(
+    requests_per_minute=RATE_LIMIT_RPM,
+    max_pending=MAX_PENDING_REQUESTS,
+)
+_original_stream_response = app.stream_response
+
+
+async def _rate_limited_stream_response(prompt: str):
+    """Gate every underlying web-model submission, including tool retries."""
+    await REQUEST_QUEUE.wait_for_provider_start()
+    async for chunk in _original_stream_response(prompt):
+        yield chunk
+
+
+# All plain chat, tool-bridge, and Anthropic adapter calls share this wrapper.
+app.stream_response = _rate_limited_stream_response
 
 # ==================== FastAPI app ====================
 api = FastAPI(title="DeepSeek Bridge API")
+api.add_middleware(RequestQueueMiddleware, queue=REQUEST_QUEUE)
 
 def extract_text(content: Any) -> str:
     """Extract plain text from OpenAI-style content (str or list of parts),
@@ -123,6 +230,9 @@ async def startup():
     print(f"  Claude Code base URL: http://127.0.0.1:{PORT}")
     print("  Mode: full passthrough + tool calling (tool_bridge.py)")
     print(f"  Prompt mode: {PROMPT_MODE}")
+    print(f"  Provider submission limit: {RATE_LIMIT_RPM} per rolling minute (smoothed)")
+    print(f"  FIFO client queue: 1 active + {MAX_PENDING_REQUESTS} waiting")
+    print("  Queue status: GET /queue/status")
     print("=" * 60 + "\n")
 
 @api.on_event("shutdown")
@@ -158,7 +268,15 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
                 },
             },
         )
-    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+    return JSONResponse(
+        status_code=422,
+        content={"error": {
+            "message": "Invalid request body.",
+            "type": "invalid_request_error",
+            "param": None,
+            "code": "validation_error",
+        }},
+    )
 
 # ==================== Chat completions ====================
 @api.post("/v1/chat/completions")
@@ -172,7 +290,15 @@ async def chat_completions(req: ChatCompletionRequest):
 
     if not req.messages:
         return JSONResponse(status_code=400, content={"error": "No messages provided."})
-    prompt = render_messages(req.messages)
+    try:
+        prompt = render_messages(req.messages)
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "Invalid or unsupported message content; this bridge accepts text-only input.",
+            "type": "invalid_request_error",
+            "param": "messages",
+            "code": "unsupported_content",
+        }})
     if not prompt.strip():
         return JSONResponse(status_code=400, content={"error": "Empty message."})
 
@@ -182,12 +308,24 @@ async def chat_completions(req: ChatCompletionRequest):
         try:
             async for chunk in app.stream_response(prompt):
                 parsed = app._parse_sse(chunk)
-                if parsed and "error" not in parsed:
+                if parsed and "error" in parsed:
+                    return JSONResponse(status_code=502, content={"error": {
+                        "message": str(parsed["error"]),
+                        "type": "upstream_error",
+                        "param": None,
+                        "code": "provider_error",
+                    }})
+                if parsed:
                     full_text += parsed.get("content", "") or ""
                     full_reasoning += parsed.get("reasoning", "") or ""
         except Exception as e:
-            print(f"[SERVER] non-streaming error: {e}")
-            return JSONResponse(status_code=500, content={"error": str(e)})
+            print(f"[SERVER] upstream request failed: {e}")
+            return JSONResponse(status_code=502, content={"error": {
+                "message": str(e),
+                "type": "upstream_error",
+                "param": None,
+                "code": "provider_error",
+            }})
 
         message = {"role": "assistant", "content": full_text}
         if full_reasoning:
@@ -201,33 +339,66 @@ async def chat_completions(req: ChatCompletionRequest):
         }
 
     async def event_stream():
+        response_id = f"chatcmpl-{uuid.uuid4()}"
+        created = int(time.time())
+        model = req.model or "deepseek-chat"
         yield ": connected\n\n"
         init = {
-            "id": f"chatcmpl-{uuid.uuid4()}",
+            "id": response_id,
             "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": req.model or "deepseek-chat",
+            "created": created,
+            "model": model,
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
         }
         yield f"data: {json.dumps(init)}\n\n"
 
         try:
             async for chunk in app.stream_response(prompt):
-                # Chunk is already a valid OpenAI SSE string – forward as-is
-                yield chunk
+                parsed = app._parse_sse(chunk)
+                if not parsed:
+                    if chunk.startswith(":"):
+                        yield chunk
+                    continue
+                if "error" in parsed:
+                    error = {"error": {
+                        "message": str(parsed["error"]),
+                        "type": "upstream_error",
+                        "code": "provider_error",
+                    }}
+                    yield f"data: {json.dumps(error)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                delta = {}
+                if parsed.get("content"):
+                    delta["content"] = parsed["content"]
+                if parsed.get("reasoning"):
+                    delta["reasoning_content"] = parsed["reasoning"]
+                if delta:
+                    item = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                    }
+                    yield f"data: {json.dumps(item)}\n\n"
 
             final = {
-                "id": f"chatcmpl-{uuid.uuid4()}",
+                "id": response_id,
                 "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": req.model or "deepseek-chat",
+                "created": created,
+                "model": model,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
             }
             yield f"data: {json.dumps(final)}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as e:
-            print(f"[SERVER] stream error: {e}")
-            err = {"error": {"message": str(e), "type": "internal_error"}}
+            print(f"[SERVER] upstream stream failed: {e}")
+            err = {"error": {
+                "message": str(e),
+                "type": "upstream_error",
+                "code": "provider_error",
+            }}
             yield f"data: {json.dumps(err)}\n\n"
             yield "data: [DONE]\n\n"
 
@@ -263,7 +434,12 @@ async def api_hello_head():
     return Response(status_code=200)
 
 
-# ==================== Health check ====================
+# ==================== Queue status and health ====================
+@api.get("/queue/status")
+async def queue_status():
+    return await REQUEST_QUEUE.snapshot()
+
+
 @api.get("/health")
 async def health():
     return {"status": "ok"}
@@ -280,8 +456,10 @@ if __name__ == "__main__":
 qwen_server.py – OpenAI-compatible API server for the Qwen Bridge
 
 Runs on port 8001 by default (DeepSeek server.py keeps port 8000).
-To change:  set QWEN_PORT env var, e.g.
+To change: set QWEN_PORT env var, e.g.
     QWEN_PORT=8020 python qwen_server.py
+Interactive startup asks for prompt mode, then a provider-submission RPM limit.
+Generation requests are queued FIFO; see /queue/status for queue statistics.
 
 Exposes the existing OpenAI-compatible Chat Completions API and a minimum
 Anthropic Messages adapter, wired to the Qwen bridge module (qwen_app.py).
@@ -305,30 +483,35 @@ from anthropic_compat import (
     handle_count_tokens,
     handle_messages,
 )
+from request_queue import RequestQueue, RequestQueueMiddleware
+from startup_config import choose_startup_config
 
-# ==================== Port ====================
+# ==================== Port and startup configuration ====================
 PORT = int(os.environ.get("QWEN_PORT", "8001"))
-
-# ==================== Prompt mode (asked at startup) ====================
-def _choose_prompt_mode() -> str:
-    env = os.environ.get("PROMPT_MODE", "").strip().lower()
-    if env in ("full", "user_only"):
-        return env
-    try:
-        print("\n=== Prompt mode selection ===")
-        print("  [1] FULL passthrough (system + all messages)")
-        print("  [2] USER message only")
-        print("  (Both modes work with Continue.dev AND DeepSeek Harness.)")
-        choice = input("Enter 1 or 2 [default 1]: ").strip()
-        return "user_only" if choice == "2" else "full"
-    except Exception:
-        return "full"
-
-PROMPT_MODE = _choose_prompt_mode()
+PROMPT_MODE, RATE_LIMIT_RPM, MAX_PENDING_REQUESTS = choose_startup_config("qwen")
 tool_bridge.PROMPT_MODE = PROMPT_MODE   # sync the global tool-bridge mode
+
+# ==================== Bounded client queue + provider pacing ====================
+REQUEST_QUEUE = RequestQueue(
+    requests_per_minute=RATE_LIMIT_RPM,
+    max_pending=MAX_PENDING_REQUESTS,
+)
+_original_stream_response = app.stream_response
+
+
+async def _rate_limited_stream_response(prompt: str):
+    """Gate every underlying web-model submission, including tool retries."""
+    await REQUEST_QUEUE.wait_for_provider_start()
+    async for chunk in _original_stream_response(prompt):
+        yield chunk
+
+
+# All plain chat, tool-bridge, and Anthropic adapter calls share this wrapper.
+app.stream_response = _rate_limited_stream_response
 
 # ==================== FastAPI app ====================
 api = FastAPI(title="Qwen Bridge API")
+api.add_middleware(RequestQueueMiddleware, queue=REQUEST_QUEUE)
 
 def extract_text(content: Any) -> str:
     """Extract plain text from OpenAI-style content (str or list of parts),
@@ -392,6 +575,9 @@ async def startup():
     print("  Model: qwen-auto")
     print("  Mode: full passthrough + tool calling (tool_bridge.py)")
     print(f"  Prompt mode: {PROMPT_MODE}")
+    print(f"  Provider submission limit: {RATE_LIMIT_RPM} per rolling minute (smoothed)")
+    print(f"  FIFO client queue: 1 active + {MAX_PENDING_REQUESTS} waiting")
+    print("  Queue status: GET /queue/status")
     print("=" * 60 + "\n")
 
 @api.on_event("shutdown")
@@ -427,7 +613,15 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
                 },
             },
         )
-    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+    return JSONResponse(
+        status_code=422,
+        content={"error": {
+            "message": "Invalid request body.",
+            "type": "invalid_request_error",
+            "param": None,
+            "code": "validation_error",
+        }},
+    )
 
 # ==================== Chat completions ====================
 @api.post("/v1/chat/completions")
@@ -441,7 +635,15 @@ async def chat_completions(req: ChatCompletionRequest):
 
     if not req.messages:
         return JSONResponse(status_code=400, content={"error": "No messages provided."})
-    prompt = render_messages(req.messages)
+    try:
+        prompt = render_messages(req.messages)
+    except (TypeError, ValueError):
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "Invalid or unsupported message content; this bridge accepts text-only input.",
+            "type": "invalid_request_error",
+            "param": "messages",
+            "code": "unsupported_content",
+        }})
     if not prompt.strip():
         return JSONResponse(status_code=400, content={"error": "Empty message."})
 
@@ -451,12 +653,24 @@ async def chat_completions(req: ChatCompletionRequest):
         try:
             async for chunk in app.stream_response(prompt):
                 parsed = app._parse_sse(chunk)
-                if parsed and "error" not in parsed:
+                if parsed and "error" in parsed:
+                    return JSONResponse(status_code=502, content={"error": {
+                        "message": str(parsed["error"]),
+                        "type": "upstream_error",
+                        "param": None,
+                        "code": "provider_error",
+                    }})
+                if parsed:
                     full_text += parsed.get("content", "") or ""
                     full_reasoning += parsed.get("reasoning", "") or ""
         except Exception as e:
-            print(f"[SERVER] non-streaming error: {e}")
-            return JSONResponse(status_code=500, content={"error": str(e)})
+            print(f"[SERVER] upstream request failed: {e}")
+            return JSONResponse(status_code=502, content={"error": {
+                "message": str(e),
+                "type": "upstream_error",
+                "param": None,
+                "code": "provider_error",
+            }})
 
         message = {"role": "assistant", "content": full_text}
         if full_reasoning:
@@ -470,33 +684,66 @@ async def chat_completions(req: ChatCompletionRequest):
         }
 
     async def event_stream():
+        response_id = f"chatcmpl-{uuid.uuid4()}"
+        created = int(time.time())
+        model = req.model or "qwen-auto"
         yield ": connected\n\n"
         init = {
-            "id": f"chatcmpl-{uuid.uuid4()}",
+            "id": response_id,
             "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": req.model or "qwen-auto",
+            "created": created,
+            "model": model,
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
         }
         yield f"data: {json.dumps(init)}\n\n"
 
         try:
             async for chunk in app.stream_response(prompt):
-                # Chunk is already a valid OpenAI SSE string – forward as-is
-                yield chunk
+                parsed = app._parse_sse(chunk)
+                if not parsed:
+                    if chunk.startswith(":"):
+                        yield chunk
+                    continue
+                if "error" in parsed:
+                    error = {"error": {
+                        "message": str(parsed["error"]),
+                        "type": "upstream_error",
+                        "code": "provider_error",
+                    }}
+                    yield f"data: {json.dumps(error)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                delta = {}
+                if parsed.get("content"):
+                    delta["content"] = parsed["content"]
+                if parsed.get("reasoning"):
+                    delta["reasoning_content"] = parsed["reasoning"]
+                if delta:
+                    item = {
+                        "id": response_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+                    }
+                    yield f"data: {json.dumps(item)}\n\n"
 
             final = {
-                "id": f"chatcmpl-{uuid.uuid4()}",
+                "id": response_id,
                 "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": req.model or "qwen-auto",
+                "created": created,
+                "model": model,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
             }
             yield f"data: {json.dumps(final)}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as e:
-            print(f"[SERVER] stream error: {e}")
-            err = {"error": {"message": str(e), "type": "internal_error"}}
+            print(f"[SERVER] upstream stream failed: {e}")
+            err = {"error": {
+                "message": str(e),
+                "type": "upstream_error",
+                "code": "provider_error",
+            }}
             yield f"data: {json.dumps(err)}\n\n"
             yield "data: [DONE]\n\n"
 
@@ -531,7 +778,12 @@ async def api_hello_head():
     return Response(status_code=200)
 
 
-# ==================== Health check ====================
+# ==================== Queue status and health ====================
+@api.get("/queue/status")
+async def queue_status():
+    return await REQUEST_QUEUE.snapshot()
+
+
 @api.get("/health")
 async def health():
     return {"status": "ok"}
@@ -539,6 +791,463 @@ async def health():
 # ==================== Entry point ====================
 if __name__ == "__main__":
     uvicorn.run(api, host="127.0.0.1", port=PORT)
+````
+
+## `request_queue.py`
+
+````python
+"""Bounded FIFO admission and per-provider request pacing for the local bridge.
+
+The bridge's browser modules have single-session state. This scheduler therefore
+admits one model-generation HTTP request per server at a time, queues later
+OpenAI/Anthropic generation requests in FIFO order, and limits every underlying
+provider submission (including tool-repair attempts) to the configured RPM.
+"""
+from __future__ import annotations
+
+import asyncio
+import time
+from collections import deque
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable
+
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+
+class RequestQueueFull(Exception):
+    """Raised when the bounded number of waiting client requests is reached."""
+
+    def __init__(self, pending: int, capacity: int) -> None:
+        self.pending = pending
+        self.capacity = capacity
+        super().__init__(f"request queue full ({pending}/{capacity} waiting)")
+
+
+@dataclass
+class RequestLease:
+    """A granted turn in the FIFO request queue."""
+
+    _owner: "RequestQueue"
+    _token: object
+    _released: bool = False
+
+    async def release(self) -> None:
+        if not self._released:
+            self._released = True
+            # Keep admission state consistent if the client disconnect cancels
+            # the ASGI task while its response is being finalized.
+            await asyncio.shield(self._owner._release_request(self._token))
+
+
+class RequestQueue:
+    """Fair in-process request gate plus smooth rolling-window RPM limiter."""
+
+    WINDOW_SECONDS = 60.0
+
+    def __init__(
+        self,
+        requests_per_minute: int,
+        max_pending: int = 100,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
+    ) -> None:
+        if isinstance(requests_per_minute, bool) or requests_per_minute < 1:
+            raise ValueError("requests_per_minute must be a positive integer")
+        if isinstance(max_pending, bool) or max_pending < 1:
+            raise ValueError("max_pending must be a positive integer")
+        self.requests_per_minute = int(requests_per_minute)
+        self.max_pending = int(max_pending)
+        self._clock = clock
+        self._sleep = sleep
+
+        self._condition = asyncio.Condition()
+        self._waiting: deque[object] = deque()
+        self._active_token: object | None = None
+        self._active_since: float | None = None
+        self._accepted = 0
+        self._completed = 0
+        self._rejected = 0
+        self._cancelled_while_waiting = 0
+
+        self._rate_lock = asyncio.Lock()
+        self._provider_starts: deque[float] = deque()
+        self._next_provider_start: float | None = None
+        self._provider_requests_started = 0
+        self._provider_interval = self.WINDOW_SECONDS / self.requests_per_minute
+
+    async def acquire_request(self) -> RequestLease:
+        """Wait for a FIFO turn; fail fast only when the pending queue is full."""
+        token = object()
+        async with self._condition:
+            if len(self._waiting) >= self.max_pending:
+                self._rejected += 1
+                raise RequestQueueFull(len(self._waiting), self.max_pending)
+            self._waiting.append(token)
+            self._accepted += 1
+            try:
+                await self._condition.wait_for(
+                    lambda: (
+                        self._active_token is None
+                        and bool(self._waiting)
+                        and self._waiting[0] is token
+                    )
+                )
+                self._waiting.popleft()
+                self._active_token = token
+                self._active_since = self._clock()
+                return RequestLease(self, token)
+            except BaseException:
+                try:
+                    self._waiting.remove(token)
+                    self._cancelled_while_waiting += 1
+                except ValueError:
+                    # The ticket may already have been promoted when a task is
+                    # cancelled; middleware's finally block releases its lease.
+                    pass
+                self._condition.notify_all()
+                raise
+
+    async def _release_request(self, token: object) -> None:
+        async with self._condition:
+            if self._active_token is token:
+                self._active_token = None
+                self._active_since = None
+                self._completed += 1
+                self._condition.notify_all()
+
+    async def wait_for_provider_start(self) -> float:
+        """Charge one provider submission and wait until it may safely begin.
+
+        Combines smooth pacing (no burst at process start) with a rolling
+        60-second count. Returns the monotonic start time for observability.
+        A cancelled wait does not consume quota.
+        """
+        while True:
+            async with self._rate_lock:
+                now = self._clock()
+                while self._provider_starts and now - self._provider_starts[0] >= self.WINDOW_SECONDS:
+                    self._provider_starts.popleft()
+
+                earliest = self._next_provider_start
+                if len(self._provider_starts) >= self.requests_per_minute:
+                    window_expiry = self._provider_starts[0] + self.WINDOW_SECONDS
+                    earliest = window_expiry if earliest is None else max(earliest, window_expiry)
+
+                delay = 0.0 if earliest is None else earliest - now
+                if delay <= 1e-9:
+                    started_at = now
+                    self._provider_starts.append(started_at)
+                    self._next_provider_start = started_at + self._provider_interval
+                    self._provider_requests_started += 1
+                    return started_at
+
+            await self._sleep(delay)
+
+    async def snapshot(self) -> dict[str, int | bool | float | None]:
+        """Return a small, prompt-free queue/rate-limit status snapshot."""
+        async with self._condition:
+            pending = len(self._waiting)
+            active = self._active_token is not None
+            active_seconds = (
+                max(0.0, self._clock() - self._active_since)
+                if self._active_since is not None
+                else None
+            )
+            accepted = self._accepted
+            completed = self._completed
+            rejected = self._rejected
+            cancelled = self._cancelled_while_waiting
+
+        async with self._rate_lock:
+            now = self._clock()
+            while self._provider_starts and now - self._provider_starts[0] >= self.WINDOW_SECONDS:
+                self._provider_starts.popleft()
+            next_start = self._next_provider_start
+            if len(self._provider_starts) >= self.requests_per_minute:
+                window_expiry = self._provider_starts[0] + self.WINDOW_SECONDS
+                next_start = window_expiry if next_start is None else max(next_start, window_expiry)
+            wait = 0.0 if next_start is None else max(0.0, next_start - now)
+            starts_last_60 = len(self._provider_starts)
+            total_provider_starts = self._provider_requests_started
+
+        return {
+            "requests_per_minute": self.requests_per_minute,
+            "provider_requests_started_last_60_seconds": starts_last_60,
+            "total_provider_requests_started": total_provider_starts,
+            "minimum_spacing_seconds": round(self._provider_interval, 3),
+            "next_provider_start_in_seconds": round(wait, 3),
+            "max_pending": self.max_pending,
+            "pending": pending,
+            "active": active,
+            "active_seconds": round(active_seconds, 3) if active_seconds is not None else None,
+            "accepted_requests": accepted,
+            "completed_requests": completed,
+            "queue_full_rejections": rejected,
+            "cancelled_while_waiting": cancelled,
+        }
+
+
+class RequestQueueMiddleware:
+    """FIFO-gate model-generation requests for the full ASGI response lifetime."""
+
+    QUEUED_PATHS = frozenset({"/v1/chat/completions", "/v1/messages"})
+
+    def __init__(self, app: ASGIApp, queue: RequestQueue) -> None:
+        self.app = app
+        self.queue = queue
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if (
+            scope.get("type") != "http"
+            or scope.get("method", "").upper() != "POST"
+            or scope.get("path") not in self.QUEUED_PATHS
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        try:
+            lease = await self.queue.acquire_request()
+        except RequestQueueFull as exc:
+            message = (
+                f"The local request queue is full ({exc.pending} of "
+                f"{exc.capacity} pending). Retry later with backoff."
+            )
+            headers = {"Cache-Control": "no-store", "X-Bridge-Queue": "full"}
+            if scope.get("path") == "/v1/messages":
+                response = JSONResponse(
+                    status_code=429,
+                    headers=headers,
+                    content={
+                        "type": "error",
+                        "error": {
+                            "type": "rate_limit_error",
+                            "message": message,
+                        },
+                    },
+                )
+            else:
+                response = JSONResponse(
+                    status_code=429,
+                    headers=headers,
+                    content={
+                        "error": {
+                            "message": message,
+                            "type": "rate_limit_error",
+                            "param": None,
+                            "code": "queue_full",
+                        }
+                    },
+                )
+            await response(scope, receive, send)
+            return
+
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            # Starlette fully consumes streaming iterators inside the ASGI call.
+            # Releasing here therefore keeps the browser slot through stream end,
+            # and also releases it on exceptions or client disconnects.
+            await lease.release()
+````
+
+## `startup_config.py`
+
+````python
+"""Interactive startup choices shared by the DeepSeek and Qwen servers.
+
+The chosen RPM is a *local outbound provider-submission pace*, not a promise
+about either provider's unpublished web-chat limits. Environment variables are
+supported for defaults, non-interactive runs, and supervised child processes.
+"""
+from __future__ import annotations
+
+import os
+import sys
+
+DEFAULT_PROMPT_MODE = "full"
+DEFAULT_RPM = 5
+DEFAULT_MAX_PENDING = 100
+MIN_RPM = 1
+MAX_RPM = 600
+MIN_MAX_PENDING = 1
+MAX_MAX_PENDING = 10_000
+
+
+def _is_interactive() -> bool:
+    try:
+        return bool(sys.stdin.isatty())
+    except Exception:
+        return False
+
+
+def _skip_prompts() -> bool:
+    return os.environ.get("BRIDGE_STARTUP_CONFIGURED", "").strip() == "1"
+
+
+def _read_choice(prompt: str) -> str:
+    try:
+        return input(prompt).strip()
+    except (EOFError, OSError):
+        return ""
+
+
+def _environment_prompt_mode() -> str | None:
+    env = os.environ.get("PROMPT_MODE", "").strip().lower()
+    aliases = {"1": "full", "2": "user_only"}
+    if env in ("full", "user_only"):
+        return env
+    if env in aliases:
+        return aliases[env]
+    if env:
+        print(f"[config] Ignoring invalid PROMPT_MODE={env!r}; choose a mode below.")
+    return None
+
+
+def choose_prompt_mode() -> str:
+    """Return ``full`` or ``user_only``; interactive terminals always ask."""
+    env_mode = _environment_prompt_mode()
+    if not _is_interactive() or _skip_prompts():
+        mode = env_mode or DEFAULT_PROMPT_MODE
+        if not _is_interactive() and env_mode is None:
+            print(f"[config] Non-interactive input; using prompt mode {mode!r}.")
+        return mode
+
+    default_mode = env_mode or DEFAULT_PROMPT_MODE
+    default_choice = "2" if default_mode == "user_only" else "1"
+    print("\n=== Prompt mode selection ===")
+    print("  [1] FULL passthrough (system + all messages)")
+    print("  [2] USER message only")
+    print("  Both modes work with Continue.dev and DeepSeek Harness.")
+    while True:
+        choice = _read_choice(f"Choose method 1 or 2 [default {default_choice}]: ")
+        if choice == "":
+            return default_mode
+        if choice == "1":
+            return "full"
+        if choice == "2":
+            return "user_only"
+        print("Please enter 1 or 2 (or press Enter for the default).")
+
+
+def _provider_env_names(provider: str) -> tuple[str, ...]:
+    normalized = provider.strip().lower()
+    if normalized in ("deepseek", "ds"):
+        return ("DEEPSEEK_RPM", "BRIDGE_RPM", "RATE_LIMIT_RPM")
+    if normalized in ("qwen", "qw"):
+        return ("QWEN_RPM", "BRIDGE_RPM", "RATE_LIMIT_RPM")
+    raise ValueError(f"Unknown bridge provider: {provider!r}")
+
+
+def _environment_rpm(provider: str) -> int | None:
+    for name in _provider_env_names(provider):
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        try:
+            rpm = int(value.strip())
+            if MIN_RPM <= rpm <= MAX_RPM:
+                return rpm
+        except (TypeError, ValueError):
+            pass
+        print(f"[config] Ignoring invalid {name}={value!r}; expected {MIN_RPM}..{MAX_RPM}.")
+    return None
+
+
+def choose_rpm(provider: str) -> int:
+    """Select a conservative positive requests-per-minute value.
+
+    The limit counts each outbound browser-backed model submission, including
+    a tool-call repair attempt, rather than merely counting inbound HTTP calls.
+    """
+    env_rpm = _environment_rpm(provider)
+    default_rpm = env_rpm or DEFAULT_RPM
+    interactive = _is_interactive() and not _skip_prompts()
+    if not interactive:
+        if env_rpm is None:
+            print(
+                f"[config] Non-interactive input; using conservative local pace "
+                f"of {default_rpm} provider requests/minute for {provider.title()}."
+            )
+        return default_rpm
+
+    print(f"\n=== {provider.title()} provider request pacing ===")
+    print("This is a local cap on model submissions, including tool-repair attempts.")
+    print("It does not reveal or override the provider's own web-chat limits.")
+    while True:
+        value = _read_choice(
+            f"Maximum provider requests per minute [{default_rpm}]: "
+        )
+        if value == "":
+            return default_rpm
+        try:
+            rpm = int(value)
+        except ValueError:
+            rpm = 0
+        if MIN_RPM <= rpm <= MAX_RPM:
+            return rpm
+        print(f"Please enter a whole number from {MIN_RPM} to {MAX_RPM}.")
+
+
+def _provider_queue_env_names(provider: str) -> tuple[str, ...]:
+    normalized = provider.strip().lower()
+    if normalized in ("deepseek", "ds"):
+        return ("DEEPSEEK_MAX_QUEUE", "BRIDGE_MAX_QUEUE")
+    if normalized in ("qwen", "qw"):
+        return ("QWEN_MAX_QUEUE", "BRIDGE_MAX_QUEUE")
+    raise ValueError(f"Unknown bridge provider: {provider!r}")
+
+
+def choose_max_pending(provider: str) -> int:
+    """Return the bounded count of requests allowed to wait in the FIFO queue."""
+    for name in _provider_queue_env_names(provider):
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        try:
+            size = int(value.strip())
+            if MIN_MAX_PENDING <= size <= MAX_MAX_PENDING:
+                return size
+        except (TypeError, ValueError):
+            pass
+        print(
+            f"[config] Ignoring invalid {name}={value!r}; expected "
+            f"{MIN_MAX_PENDING}..{MAX_MAX_PENDING}."
+        )
+
+    return DEFAULT_MAX_PENDING
+
+
+def choose_startup_config(provider: str) -> tuple[str, int, int]:
+    """Ask the startup questions in the requested order and return settings."""
+    mode = choose_prompt_mode()
+    rpm = choose_rpm(provider)
+    max_pending = choose_max_pending(provider)
+    return mode, rpm, max_pending
+
+
+def environment_for_child(
+    provider: str,
+    prompt_mode: str,
+    rpm: int,
+    max_pending: int,
+    base: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Create child env with the selected per-provider settings made explicit."""
+    env = dict(os.environ if base is None else base)
+    normalized = provider.strip().lower()
+    if normalized in ("deepseek", "ds"):
+        rpm_name, queue_name = "DEEPSEEK_RPM", "DEEPSEEK_MAX_QUEUE"
+    elif normalized in ("qwen", "qw"):
+        rpm_name, queue_name = "QWEN_RPM", "QWEN_MAX_QUEUE"
+    else:
+        raise ValueError(f"Unknown bridge provider: {provider!r}")
+    env["PROMPT_MODE"] = prompt_mode
+    env[rpm_name] = str(rpm)
+    env[queue_name] = str(max_pending)
+    env["BRIDGE_STARTUP_CONFIGURED"] = "1"
+    return env
 ````
 
 ## `tool_bridge.py`
@@ -2636,69 +3345,110 @@ jsonschema>=4.23,<5
 ## `run_both.py`
 
 ````python
+"""Start both browser-backed bridge APIs from one console.
+
+DeepSeek listens on 127.0.0.1:8000 and Qwen on 127.0.0.1:8001. The
+supervisor collects the shared prompt mode and each backend's own RPM choice,
+then passes the settings to child processes so prompts never race on stdin.
 """
-run_both.py – Start BOTH bridges from one project folder.
+from __future__ import annotations
 
-  DeepSeek -> http://127.0.0.1:8000/v1   (server.py,  model: deepseek-chat)
-  Qwen     -> http://127.0.0.1:8001/v1   (qwen_server.py, model: qwen-auto)
-
-Each server runs in its own Python process / console window.
-Press Ctrl+C here to stop both.
-
-Note: browser profiles are separate (./browser_data for DeepSeek,
-./qwen_browser_data for Qwen), so both can run at the same time.
-"""
 import os
 import subprocess
 import sys
 import time
 
+from startup_config import (
+    choose_max_pending,
+    choose_prompt_mode,
+    choose_rpm,
+    environment_for_child,
+)
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 
 
-def start_server(name: str, script: str, port_env: str, port: int):
-    env = dict(os.environ)
-    env[port_env] = str(port)
+def start_server(name: str, script: str, port_env: str, port: int, env: dict[str, str]):
+    child_env = dict(env)
+    child_env[port_env] = str(port)
     flags = subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0
     proc = subprocess.Popen(
         [sys.executable, script],
         cwd=BASE,
-        env=env,
+        env=child_env,
         creationflags=flags,
     )
     print(f"[run_both] started {name}: {script} on port {port} (pid {proc.pid})")
     return proc
 
 
-def main():
-    print("Starting both bridges...")
-    procs = [
-        start_server("DeepSeek", "server.py", "DEEPSEEK_PORT", 8000),
-        start_server("Qwen", "qwen_server.py", "QWEN_PORT", 8001),
-    ]
-    print("\nBoth bridges are starting. Log in to each browser when it opens,")
-    print("OpenAI-compatible clients (for example, Continue):")
-    print("  DeepSeek: http://127.0.0.1:8000/v1  (model deepseek-chat)")
-    print("  Qwen:     http://127.0.0.1:8001/v1  (model qwen-auto)")
-    print("Claude Code / Anthropic Messages base URL (choose one backend per session):")
-    print("  DeepSeek: http://127.0.0.1:8000")
-    print("  Qwen:     http://127.0.0.1:8001")
-    print("Set ANTHROPIC_BASE_URL to the selected URL. Press Ctrl+C here to stop both.\n")
+def _stop_processes(names: list[str], procs: list[subprocess.Popen]) -> None:
+    for proc in procs:
+        if proc.poll() is None:
+            proc.terminate()
+    for name, proc in zip(names, procs):
+        try:
+            proc.wait(timeout=5)
+            print(f"[run_both] {name} stopped.")
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+            print(f"[run_both] {name} killed after shutdown timeout.")
 
+
+def main() -> None:
+    prompt_mode = choose_prompt_mode()
+    deepseek_rpm = choose_rpm("deepseek")
+    qwen_rpm = choose_rpm("qwen")
+    deepseek_pending = choose_max_pending("deepseek")
+    qwen_pending = choose_max_pending("qwen")
+
+    deepseek_env = environment_for_child(
+        "deepseek", prompt_mode, deepseek_rpm, deepseek_pending
+    )
+    qwen_env = environment_for_child("qwen", prompt_mode, qwen_rpm, qwen_pending)
+
+    print("\nStarting both bridges with independent provider queues:")
+    print(f"  Prompt mode: {prompt_mode}")
+    print(f"  DeepSeek: {deepseek_rpm} provider requests/min, {deepseek_pending} pending slots")
+    print(f"  Qwen:     {qwen_rpm} provider requests/min, {qwen_pending} pending slots")
+
+    names: list[str] = []
+    procs: list[subprocess.Popen] = []
     try:
+        deepseek = start_server(
+            "DeepSeek", "server.py", "DEEPSEEK_PORT", 8000, deepseek_env
+        )
+        names.append("DeepSeek")
+        procs.append(deepseek)
+        qwen = start_server("Qwen", "qwen_server.py", "QWEN_PORT", 8001, qwen_env)
+        names.append("Qwen")
+        procs.append(qwen)
+
+        print("\nOpenAI-compatible clients:")
+        print("  DeepSeek: http://127.0.0.1:8000/v1  (model deepseek-chat)")
+        print("  Qwen:     http://127.0.0.1:8001/v1  (model qwen-auto)")
+        print("Claude Code / Anthropic Messages base URL (choose one backend per session):")
+        print("  DeepSeek: http://127.0.0.1:8000")
+        print("  Qwen:     http://127.0.0.1:8001")
+        print("Queue stats: GET /queue/status on either server.")
+        print("Both services remain loopback-only. Press Ctrl+C here to stop both.\n")
+
         while True:
+            exited = [(name, proc.returncode) for name, proc in zip(names, procs)
+                      if proc.poll() is not None]
+            if exited:
+                for name, code in exited:
+                    print(f"[run_both] {name} exited with code {code}; stopping the other bridge.")
+                _stop_processes(names, procs)
+                return
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n[run_both] shutting down both servers...")
-        for name, proc in zip(("DeepSeek", "Qwen"), procs):
-            proc.terminate()
-        for name, proc in zip(("DeepSeek", "Qwen"), procs):
-            try:
-                proc.wait(timeout=5)
-                print(f"[run_both] {name} stopped.")
-            except Exception:
-                proc.kill()
-                print(f"[run_both] {name} killed.")
+        _stop_processes(names, procs)
+    except Exception:
+        _stop_processes(names, procs)
+        raise
 
 
 if __name__ == "__main__":
@@ -3496,6 +4246,8 @@ import unittest
 import httpx
 
 os.environ.setdefault("PROMPT_MODE", "full")
+os.environ.setdefault("DEEPSEEK_RPM", "5")
+os.environ.setdefault("QWEN_RPM", "5")
 import server  # noqa: E402
 import qwen_server  # noqa: E402
 
@@ -3530,6 +4282,10 @@ async def _fake_stream_response(prompt: str):
         yield _openai_sse("fake reply")
 
 
+async def _fake_error_stream(prompt: str):
+    yield 'data: {"error":{"message":"synthetic provider failure","type":"internal_error"}}\n\n'
+
+
 class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.servers = [
@@ -3546,7 +4302,7 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
             bridge.stream_response = original
 
     async def test_messages_openai_and_tool_routes_for_both_servers(self):
-        for api, _, backend_model in self.servers:
+        for api, bridge, backend_model in self.servers:
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=api),
                 base_url="http://test",
@@ -3581,6 +4337,49 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
                 })
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual(response.json()["choices"][0]["message"]["content"], "fake reply")
+
+                queue_status = await client.get("/queue/status")
+                self.assertEqual(queue_status.status_code, 200, queue_status.text)
+                self.assertEqual(queue_status.json()["pending"], 0)
+                self.assertEqual(queue_status.json()["requests_per_minute"], 5)
+
+                invalid_content = await client.post("/v1/chat/completions", json={
+                    "messages": [{"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": "https://example.invalid/image.png"}}
+                    ]}],
+                })
+                self.assertEqual(invalid_content.status_code, 400, invalid_content.text)
+
+                invalid_body = await client.post("/v1/chat/completions", json={
+                    "messages": [{"role": "user", "content": "safe"}],
+                    "parallel_tool_calls": "sensitive-validation-marker",
+                })
+                self.assertEqual(invalid_body.status_code, 422, invalid_body.text)
+                self.assertNotIn("sensitive-validation-marker", invalid_body.text)
+
+                bridge.stream_response = _fake_error_stream
+                provider_error = await client.post("/v1/chat/completions", json={
+                    "model": backend_model,
+                    "messages": messages,
+                    "stream": False,
+                })
+                self.assertEqual(provider_error.status_code, 502, provider_error.text)
+                self.assertEqual(provider_error.json()["error"]["code"], "provider_error")
+
+                bridge.stream_response = _fake_stream_response
+                streaming = await client.post("/v1/chat/completions", json={
+                    "model": backend_model,
+                    "messages": messages,
+                    "stream": True,
+                })
+                self.assertEqual(streaming.status_code, 200, streaming.text)
+                chunks = [
+                    json.loads(line[6:]) for line in streaming.text.splitlines()
+                    if line.startswith("data: {")
+                ]
+                self.assertGreaterEqual(len(chunks), 3)
+                self.assertEqual(len({chunk["id"] for chunk in chunks}), 1)
+                self.assertIn("data: [DONE]", streaming.text)
 
                 response = await client.post("/v1/chat/completions", json={
                     "model": backend_model,
@@ -3650,6 +4449,218 @@ if __name__ == "__main__":
     unittest.main(verbosity=2)
 ````
 
+## `test_request_queue.py`
+
+````python
+"""FIFO queue, RPM pacing, cancellation, and HTTP back-pressure tests."""
+from __future__ import annotations
+
+import asyncio
+import unittest
+
+import httpx
+from fastapi import FastAPI
+
+from request_queue import RequestQueue, RequestQueueFull, RequestQueueMiddleware
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.value = 0.0
+
+    def now(self) -> float:
+        return self.value
+
+    async def sleep(self, delay: float) -> None:
+        self.value += delay
+        await asyncio.sleep(0)
+
+
+class RequestQueueTests(unittest.IsolatedAsyncioTestCase):
+    async def _wait_for_pending(self, queue: RequestQueue, expected: int) -> None:
+        for _ in range(100):
+            if (await queue.snapshot())["pending"] == expected:
+                return
+            await asyncio.sleep(0)
+        self.fail(f"queue did not reach pending={expected}")
+
+    async def test_provider_starts_are_smoothed_and_rolling_window_bounded(self):
+        clock = FakeClock()
+        queue = RequestQueue(2, clock=clock.now, sleep=clock.sleep)
+
+        starts = [await queue.wait_for_provider_start() for _ in range(3)]
+
+        self.assertEqual(starts, [0.0, 30.0, 60.0])
+        status = await queue.snapshot()
+        self.assertEqual(status["provider_requests_started_last_60_seconds"], 2)
+        self.assertEqual(status["total_provider_requests_started"], 3)
+
+    async def test_fifo_order_and_bounded_waiting_capacity(self):
+        queue = RequestQueue(60, max_pending=2)
+        first = await queue.acquire_request()
+        order: list[str] = []
+
+        async def queued_request(name: str) -> None:
+            lease = await queue.acquire_request()
+            try:
+                order.append(name)
+            finally:
+                await lease.release()
+
+        second = asyncio.create_task(queued_request("second"))
+        await self._wait_for_pending(queue, 1)
+        third = asyncio.create_task(queued_request("third"))
+        await self._wait_for_pending(queue, 2)
+
+        with self.assertRaises(RequestQueueFull):
+            await queue.acquire_request()
+
+        await first.release()
+        await asyncio.gather(second, third)
+        self.assertEqual(order, ["second", "third"])
+        status = await queue.snapshot()
+        self.assertEqual(status["pending"], 0)
+        self.assertEqual(status["queue_full_rejections"], 1)
+        self.assertEqual(status["completed_requests"], 3)
+
+    async def test_cancelled_waiter_is_removed_and_does_not_block_queue(self):
+        queue = RequestQueue(60, max_pending=2)
+        active = await queue.acquire_request()
+
+        async def wait_forever() -> None:
+            await queue.acquire_request()
+
+        waiter = asyncio.create_task(wait_forever())
+        await self._wait_for_pending(queue, 1)
+        waiter.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await waiter
+
+        status = await queue.snapshot()
+        self.assertEqual(status["pending"], 0)
+        self.assertEqual(status["cancelled_while_waiting"], 1)
+        await active.release()
+
+    async def test_asgi_middleware_queues_and_returns_protocol_specific_429(self):
+        queue = RequestQueue(60, max_pending=1)
+        app = FastAPI()
+        app.add_middleware(RequestQueueMiddleware, queue=queue)
+        first_entered = asyncio.Event()
+        finish_first = asyncio.Event()
+        processed: list[int] = []
+
+        @app.post("/v1/chat/completions")
+        async def chat():
+            index = len(processed) + 1
+            processed.append(index)
+            if index == 1:
+                first_entered.set()
+                await finish_first.wait()
+            return {"processed": index}
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            first = asyncio.create_task(client.post("/v1/chat/completions", json={"n": 1}))
+            await asyncio.wait_for(first_entered.wait(), timeout=1)
+            second = asyncio.create_task(client.post("/v1/chat/completions", json={"n": 2}))
+            await self._wait_for_pending(queue, 1)
+
+            openai_rejection = await client.post("/v1/chat/completions", json={"n": 3})
+            self.assertEqual(openai_rejection.status_code, 429)
+            self.assertEqual(openai_rejection.json()["error"]["code"], "queue_full")
+            self.assertEqual(openai_rejection.headers["x-bridge-queue"], "full")
+
+            anthropic_rejection = await client.post("/v1/messages", json={"n": 4})
+            self.assertEqual(anthropic_rejection.status_code, 429)
+            self.assertEqual(anthropic_rejection.json()["type"], "error")
+            self.assertEqual(
+                anthropic_rejection.json()["error"]["type"], "rate_limit_error"
+            )
+
+            finish_first.set()
+            first_response, second_response = await asyncio.gather(first, second)
+            self.assertEqual(first_response.status_code, 200)
+            self.assertEqual(second_response.status_code, 200)
+            self.assertEqual(processed, [1, 2])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+````
+
+## `test_startup_config.py`
+
+````python
+"""Tests for startup prompt order, validation, and non-interactive overrides."""
+from __future__ import annotations
+
+import os
+import unittest
+from unittest.mock import patch
+
+import startup_config
+
+
+class StartupConfigTests(unittest.TestCase):
+    def test_startup_asks_method_then_rpm_and_retries_invalid_values(self):
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(startup_config, "_is_interactive", return_value=True), \
+                patch("builtins.input", side_effect=["x", "2", "zero", "7"]) as prompt:
+            mode, rpm, pending = startup_config.choose_startup_config("deepseek")
+
+        self.assertEqual((mode, rpm, pending), ("user_only", 7, 100))
+        self.assertEqual(prompt.call_count, 4)
+        self.assertIn("method 1 or 2", prompt.call_args_list[1].args[0])
+        self.assertIn("requests per minute", prompt.call_args_list[3].args[0])
+
+    def test_environment_values_skip_interactive_prompts(self):
+        with patch.dict(os.environ, {
+            "PROMPT_MODE": "2",
+            "DEEPSEEK_RPM": "12",
+            "DEEPSEEK_MAX_QUEUE": "30",
+            "BRIDGE_STARTUP_CONFIGURED": "1",
+        }, clear=True), \
+                patch.object(startup_config, "_is_interactive", return_value=True), \
+                patch("builtins.input") as prompt:
+            config = startup_config.choose_startup_config("deepseek")
+
+        self.assertEqual(config, ("user_only", 12, 30))
+        prompt.assert_not_called()
+
+    def test_interactive_launch_still_asks_when_environment_defaults_exist(self):
+        with patch.dict(os.environ, {
+            "PROMPT_MODE": "user_only",
+            "DEEPSEEK_RPM": "12",
+        }, clear=True), \
+                patch.object(startup_config, "_is_interactive", return_value=True), \
+                patch("builtins.input", side_effect=["", ""]) as prompt:
+            config = startup_config.choose_startup_config("deepseek")
+
+        self.assertEqual(config, ("user_only", 12, 100))
+        self.assertEqual(prompt.call_count, 2)
+        self.assertIn("default 2", prompt.call_args_list[0].args[0])
+        self.assertIn("[12]", prompt.call_args_list[1].args[0])
+
+    def test_noninteractive_launch_uses_safe_defaults(self):
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(startup_config, "_is_interactive", return_value=False):
+            self.assertEqual(startup_config.choose_startup_config("qwen"), ("full", 5, 100))
+
+    def test_environment_values_are_explicit_for_run_both_children(self):
+        base = {"EXISTING": "kept", "BRIDGE_RPM": "99"}
+        env = startup_config.environment_for_child("qwen", "full", 8, 25, base)
+        self.assertEqual(env["EXISTING"], "kept")
+        self.assertEqual(env["PROMPT_MODE"], "full")
+        self.assertEqual(env["QWEN_RPM"], "8")
+        self.assertEqual(env["QWEN_MAX_QUEUE"], "25")
+        self.assertEqual(env["BRIDGE_STARTUP_CONFIGURED"], "1")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+````
+
 ## `CLAUDE_CODE_SETUP.md`
 
 ````markdown
@@ -3675,19 +4686,37 @@ Install updated dependencies after replacing the files:
 python -m pip install -r requirements.txt
 ```
 
-## Run the bridge
+## Run the bridge and configure the queue
 
-Start the backend server in one terminal. Use `PROMPT_MODE=full` so it includes the full conversation:
+Start either server in a console. By default it asks for the prompt mode first, then asks for a positive provider-submission limit per minute (Enter accepts the conservative default of 5):
+
+```powershell
+python server.py       # DeepSeek, port 8000
+# or
+python qwen_server.py  # Qwen, port 8001
+```
+
+The RPM value paces **outbound browser-backed model submissions**, not just client HTTP requests. Each tool-call repair attempt also counts. The prompt is a local safety setting; it cannot discover or override the provider's own web-chat limits.
+
+For non-interactive launches, set environment variables instead. On an interactive terminal, valid environment values prefill the prompts; the console still asks unless a supervisor has already chosen the settings. Provider-specific values take precedence over `BRIDGE_RPM` and `RATE_LIMIT_RPM`:
 
 ```powershell
 # DeepSeek
-$env:PROMPT_MODE = 'full'
+$env:PROMPT_MODE = 'full'       # or 'user_only'
+$env:DEEPSEEK_RPM = '5'
 python server.py
 
-# Or Qwen, in a separate run
+# Qwen
 $env:PROMPT_MODE = 'full'
+$env:QWEN_RPM = '5'
 python qwen_server.py
 ```
+
+The client queue is on by default. Each server runs one browser-backed generation at a time in FIFO order, then paces provider starts against a rolling 60-second window without a startup burst. By default, up to 100 additional generation requests may wait; change this with `DEEPSEEK_MAX_QUEUE`, `QWEN_MAX_QUEUE`, or the shared `BRIDGE_MAX_QUEUE` environment variable. `GET /queue/status` reports queue depth and recent provider starts.
+
+No finite machine can safely hold an unlimited backlog. If all pending slots are occupied, the bridge returns a structured HTTP 429 `queue_full` response instead of growing memory without bound or crashing. Clients should back off before retrying; while the process remains up, accepted requests stay queued rather than being silently discarded. The in-memory queue is not durable: a process crash/restart can interrupt queued work. The cap is configurable from 1 to 10,000 pending requests.
+
+`run_both.py` asks for the prompt mode and independent DeepSeek/Qwen RPM values in its own console, then passes those settings to each child process. This avoids two child processes racing to read the same terminal input.
 
 Start Claude Code in a second terminal with the base URL set to the server root (do not append `/v1`):
 
@@ -3709,6 +4738,7 @@ The DeepSeek/Qwen bridges open a visible browser and wait for manual login. Brow
 - Qwen: `POST http://127.0.0.1:8001/v1/messages`, optional `/v1/messages/count_tokens`.
 - Existing OpenAI route remains `POST /v1/chat/completions` on both servers.
 - `GET` and `HEAD /api/hello` are lightweight client connectivity probes; `/health` remains available.
+- `GET /queue/status` reports FIFO queue depth, active request time, RPM pacing, and local counters.
 
 ## Tool-calling model and limitations
 
@@ -3732,6 +4762,104 @@ python test_api_smoke.py
 ```
 
 These use fake streams and validate the existing DeepSeek/Qwen stream parsers, tool-call parsing/validation and both API routes, Anthropic/OpenAI SSE framing, and tool-choice behavior. They do not verify live provider selectors, browser logins, or current DeepSeek/Qwen website behavior.
+````
+
+## `QUEUE_RATE_LIMIT_RESEARCH.md`
+
+````markdown
+# Queue and rate-limit design research
+
+**Prepared:** 2026-10-27 (Asia/Colombo)  
+**Scope:** The existing DeepSeek/Qwen browser-session bridge, preserving its visible browser/UI workflow and OpenAI Chat Completions plus Anthropic Messages routes.
+
+## Executive summary
+
+The bridge needs two different controls, not just a rate counter:
+
+1. **A bounded FIFO admission queue for client generation requests.** This smooths concurrent client arrivals, preserves order, and limits how many requests can wait in memory.
+2. **A provider-submission rate limiter.** This paces each actual model submission, including a tool-call repair attempt, rather than counting only the outer client request.
+
+The two existing browser backends are stateful: each uses one persistent page and shared per-turn interception state, and each `stream_response()` already has a process-level lock. Running multiple generations against the same browser session concurrently is therefore not a safe throughput optimization. The implementation deliberately admits **one active generation per backend process**, queues later requests FIFO, and enforces a smooth RPM ceiling for outbound submissions.
+
+No finite queue can guarantee acceptance of an unlimited arrival rate or prevent every client-side timeout. This implementation caps the default backlog at 100 waiting requests. If that cap is reached, it responds with an explicit, protocol-shaped HTTP 429 rather than leaking memory, dropping an already-admitted request, or crashing. Clients should use backoff when they receive `queue_full`.
+
+## What provider documentation does and does not establish
+
+- DeepSeek's current **API** rate/isolation page describes account-level concurrency limits for API models and states that exceeding a limit can produce HTTP 429. That is useful evidence that concurrency and rate enforcement are provider-side concerns, but it is **not a published RPM guarantee for the DeepSeek web-chat UI** used by this project. [1](https://api-docs.deepseek.com/quick_start/rate_limit/)
+- Alibaba Cloud Model Studio publishes quotas that vary by model and service scope, and its best-practices guide recommends layered request pacing and concurrency control. Those are **Model Studio API** rules, not a transferable quota for the consumer Qwen web-chat UI or this logged-in browser session. [1](https://help.aliyun.com/zh/model-studio/rate-limit) [3](https://help.aliyun.com/en/model-studio/rate-limiting-best-practices)
+- Therefore there is no evidence-based universal number that this bridge can safely choose for every web account. Startup asks the operator. The default of 5 provider submissions/minute is only a conservative starting point, not an official provider allowance, an account guarantee, or a way to bypass provider enforcement.
+
+The bridge does not call provider APIs directly, rotate accounts, evade rate controls, spoof browser identity, or retry provider throttling to defeat a limit.
+
+## Design choices
+
+### 1. FIFO queue for inbound generation requests
+
+`POST /v1/chat/completions` and `POST /v1/messages` enter a per-process FIFO gate. One request owns the browser-backed generation slot at a time. Later requests wait in arrival order, and the slot remains held through the full response stream, completion, error, or client disconnect. Cancellation while waiting removes the waiter so it does not block later work.
+
+The queue stores admission tickets, not whole copied prompt payloads. Its default is **100 pending requests** (plus one active request); `DEEPSEEK_MAX_QUEUE`, `QWEN_MAX_QUEUE`, or `BRIDGE_MAX_QUEUE` can change the cap. The status endpoint is `GET /queue/status`.
+
+Health checks, model listing, connectivity probes, and Anthropic's local token-count estimate do not consume provider quota and do not wait behind generation work.
+
+### 2. Provider-start rate limiting
+
+The selected RPM counts starts of `bridge.stream_response()`—the point that submits a prompt to the logged-in provider session. That includes tool-call repair attempts because repairs make another model request. It does not count one outer request as one when that request causes several provider submissions.
+
+Starts are spaced by at least `60 / RPM` seconds and checked against a rolling 60-second history. This avoids a large token-bucket burst immediately after startup, while keeping the actual number of provider starts within the configured rolling-minute cap. Separate DeepSeek and Qwen processes have independent rate histories.
+
+### 3. Bounded overload behavior
+
+The local pending queue is finite by design. A FIFO queue with no maximum is effectively an unbounded resource commitment; Python's async queue documentation explicitly distinguishes finite `maxsize` from the default infinite queue. [1](https://docs.python.org/3/library/asyncio-queue.html)
+
+When the configured pending capacity is full:
+
+- OpenAI callers receive HTTP 429 with `error.code = "queue_full"`.
+- Anthropic Messages callers receive HTTP 429 with an Anthropic-shaped `rate_limit_error` body.
+- The body explains that the local queue is full and recommends retrying with backoff. Request contents are not included.
+
+RFC 6585 defines 429 for rate limiting and says the response should explain the condition; `Retry-After` is optional. This queue-full case has no dependable wait estimate because an active browser response can take a variable amount of time, so the bridge does not publish a misleading fixed `Retry-After`. [3](https://www.rfc-editor.org/info/rfc6585/)
+
+This is controlled backpressure, not a promise that clients can never see a 429. It is safer than accepting unlimited queued work or silently losing accepted work.
+
+### 4. Startup configuration
+
+Standalone launches ask in this order:
+
+1. prompt method `[1] FULL passthrough` or `[2] USER message only`;
+2. maximum provider model submissions per minute (positive integer from 1 to 600; Enter selects 5).
+
+Non-interactive launches use environment overrides or safe defaults. `run_both.py` gathers the shared prompt mode and a separate RPM choice for each provider in its own console, then passes the settings to both processes so the two child processes cannot race to read the same standard input.
+
+Environment variables:
+
+| Purpose | DeepSeek | Qwen | Shared fallback |
+|---|---|---|---|
+| Prompt mode | `PROMPT_MODE=full` or `user_only` | same | same |
+| RPM | `DEEPSEEK_RPM` | `QWEN_RPM` | `BRIDGE_RPM`, then `RATE_LIMIT_RPM` |
+| Pending queue capacity | `DEEPSEEK_MAX_QUEUE` | `QWEN_MAX_QUEUE` | `BRIDGE_MAX_QUEUE` |
+
+## Safety and operational limits
+
+- The queue and rate counter are **in-memory and per server process**. They do not coordinate two processes, two machines, or multiple Uvicorn workers. The normal `python server.py` / `python qwen_server.py` launch is one process; do not increase workers if you expect this configured rate to be a global limit.
+- A server restart ends its in-memory queue. Clients with a long wait may time out on their own; the bridge cannot control their timeout settings.
+- A request queue is not a durable job system. It does not persist requests across process or machine failure, and it does not automatically retry a provider failure.
+- Queueing does not make the browser/UI integration native or officially supported. Provider website changes, login expiry, account restrictions, network failures, and web-chat quotas can still prevent responses. Use non-sensitive test work and keep the service bound to loopback.
+- Rate settings are local caps chosen by the user. A low number is sensible when the applicable web-chat allowance is unknown; do not interpret API quota tables as the limit for a web session.
+
+## Correctness hardening included with the queue
+
+The new release also closes issues found during the preceding repository audit:
+
+- validation failures return generic, sanitized 422 error bodies rather than echoing Pydantic's submitted `input` value;
+- unsupported text/image message content returns a clean 400 response;
+- provider failures in non-streaming OpenAI requests return 502 instead of a false 200 empty answer;
+- regular OpenAI stream chunks now keep a stable completion ID and report stream failures as error events rather than appending a success finish chunk.
+
+## Verification plan and results
+
+The implementation adds tests for FIFO order, bounded queue capacity, cancellation removal, rolling-window pacing, both 429 response shapes, startup question order/validation, safe environment overrides, sanitized validation errors, unsupported content, provider errors, and stable stream IDs.
+
+Offline tests use fake provider streams and an ASGI test transport. They do **not** sign in to DeepSeek/Qwen or perform a live browser/provider round trip. Live UI behavior, current account-specific web limits, and actual client timeout settings remain unverified.
 ````
 
 ## `REFERENCE_REVIEW.md`
@@ -3777,146 +4905,68 @@ Offline verification passed after these changes:
 - `python test_parser.py` — 10 existing DeepSeek/Qwen parser scenarios.
 - `python -m compileall -q .`, Ruff `--select F,E9`, and `git diff --check`.
 
-These tests use fake provider streams. There is still **no live browser/provider/agent round trip**, so no claim is made that every model will emit parseable tool calls or that every version of Claude Code/other agent clients will work. The bridge's tool calls remain model-generated text, not native provider function calls. Token estimates and unsupported Anthropic features remain as described in `CLAUDE_CODE_SETUP.md`. `pip-audit` is not installed in the workspace, so a current dependency vulnerability audit was not performed.
+These tests use fake provider streams. There is still **no live browser/provider/agent round trip**, so no claim is made that every model will emit parseable tool calls or that every version of Claude Code/other agent clients will work. The bridge's tool calls remain model-generated text, not native provider function calls. Token estimates and unsupported Anthropic features remain as described in `CLAUDE_CODE_SETUP.md`. `pip-audit` was not installed during the earlier review, so that review did not perform a dependency vulnerability audit.
+
+## Queue/rate-limit implementation addendum — 2026-10-27
+
+The startup flow now asks for method 1 or 2, followed by a local provider-submission RPM value (default 5). Each backend has a bounded FIFO queue (one active generation plus 100 pending by default) and a smooth rolling-minute start limiter. Tool-repair submissions count against RPM. `GET /queue/status` exposes non-sensitive counters. Saturation returns a shaped 429 response; see `QUEUE_RATE_LIMIT_RESEARCH.md` for the design, research, and operational caveats.
+
+The prior audit's three reproduced API defects were also addressed: validation errors no longer echo input values, unsupported message content yields 400, and provider failures no longer become successful empty non-streaming completions. Regular OpenAI stream chunks now share a stable ID. The current offline suite comprises `test_parser.py`, `test_tool_bridge.py` (13), `test_anthropic_compat.py` (13), `test_api_smoke.py`, `test_request_queue.py` (4), and `test_startup_config.py` (5); all pass in the workspace. Ruff `F,E9`, compilation, and `git diff --check` pass. These remain fake-stream/offline checks only; live provider behavior is unverified.
 ````
 
 ## `ANALYSIS.md`
 
 ````markdown
-# Initial repository review: `webchat-llm-bridge` (pre-patch baseline)
+# Current project analysis — queue-enabled release
 
-> This is the historical review from before the Anthropic Messages compatibility work. The current implementation adds `anthropic_compat.py`, updates both server files and `tool_bridge.py`, and adds `jsonschema` to `requirements.txt`. Tool calling received a further reference-driven review; see `REFERENCE_REVIEW.md` for current changes, checks, and limitations. See `CLAUDE_CODE_SETUP.md` for the current install/run guide. Findings below describe the pre-patch baseline unless explicitly noted.
-
-**Review date:** 2026-10-26 (Asia/Colombo)  
-**Repository:** `travelert698/webchat-llm-bridge`  
-**Reviewed revision:** `372c049ccb7e500241a03df644ed186882065adf` (`main`, 2026-09-05)
+**Review date:** 2026-10-27 (Asia/Colombo)  
+**Scope:** Current source tree after the FIFO request queue and RPM limiter changes. This replaces the older pre-patch baseline review.
 
 ## Executive summary
 
-This is a small Python prototype that exposes local OpenAI-shaped endpoints for DeepSeek Web and Qwen Web. It opens a visible Chromium session, expects a person to log in, types a prompt into the provider website, intercepts that site's authenticated completion request, and replays it through HTTPX. A separate module attempts to turn model-emitted text into OpenAI tool calls.
+This is a local, browser-session relay for DeepSeek Web and Qwen Web. It exposes OpenAI Chat Completions and a minimal Anthropic Messages adapter, asks for a prompt-format mode and a local provider-request pacing value at interactive startup, and serializes generation requests through a bounded FIFO queue. It is not a local model and it is not the official provider API.
 
-**Recommendation: do not treat this as production-ready or expose it to a network.** The source review found no obvious hidden installer, `eval`/`exec`, or arbitrary shell execution. `run_both.py` starts the two fixed local Python scripts. However, the program intentionally sends conversation data through the logged-in provider website, stores browser-session data locally, has no API authentication, and has important tool-call validation and parser defects. Use only for isolated experimentation with non-sensitive prompts until those issues are fixed. Official provider APIs are a safer and more stable choice for production.
+The bridge now has explicit request backpressure, rate pacing for every actual browser-backed model submission (including tool-repair attempts), protocol-shaped queue-full 429 responses, queue status visibility, and cancellation-safe queue release. The rate setting does not determine, discover, or bypass a provider's actual web-chat limits. There is no live account/browser test, so the project should still be treated as experimental rather than production-ready.
 
-## What was installed and what was not
+## Current queue behavior
 
-- Cloned the repository into `/home/user/webchat-llm-bridge`.
-- Installed `requirements.txt` into an **isolated project virtual environment** (`.venv`), not into the assistant host OS or your personal computer. The requirements are unpinned; this sandbox resolved FastAPI 0.162.0, Uvicorn 0.54.0, Playwright 1.64.1, Pydantic 2.14.1, and HTTPX 0.28.1.
-- Did **not** install Playwright's Chromium browser, open a provider website, sign in, or send a live prompt. Those steps require an actual browser runtime and your own account/session. So the web automation and provider integration remain unverified end-to-end.
-- No source files were changed; `ANALYSIS.md` is the only added deliverable. The local `.venv` and cache artifacts are ignored/excluded from workspace snapshots, so they should not be considered a portable installation.
+- `POST /v1/chat/completions` and `POST /v1/messages` are admitted FIFO, with one active generation per server process.
+- Default pending capacity is 100. When full, the bridge returns a structured OpenAI- or Anthropic-shaped 429; it does not grow an unbounded in-memory backlog.
+- The startup RPM value counts each call to the browser-backed model stream, including tool-format repair submissions, and uses smooth pacing plus a rolling 60-second count.
+- `/queue/status` exposes pending depth, current active duration, recent provider starts, and local counters without request text.
+- The queue is in-memory and per process. It is not durable and does not coordinate separate processes or multiple workers.
 
-## What the project contains
+Detailed research, provider-limit caveats, configuration, and sources are in `QUEUE_RATE_LIMIT_RESEARCH.md`. Installation and operation are in `CLAUDE_CODE_SETUP.md`.
 
-| File | Purpose |
-|---|---|
-| `app.py` | DeepSeek Web automation, SSE parsing, local response streaming |
-| `qwen_app.py` | Qwen Web automation and SSE parsing |
-| `server.py` | DeepSeek OpenAI-style API, normally port 8000 |
-| `qwen_server.py` | Qwen OpenAI-style API, normally port 8001 |
-| `tool_bridge.py` | Converts model text into OpenAI-style tool-call responses |
-| `run_both.py` | Starts both local servers as child processes |
-| `test_parser.py` | Small mocked tests for the DeepSeek and Qwen provider parsers |
-| `requirements.txt` | Unpinned Python runtime dependencies |
+## Security and privacy
 
-The expected runtime is interactive: a visible browser opens and waits for manual login. Browser profiles (`browser_data/` and `qwen_browser_data/`) retain provider login state. `.gitignore` excludes those directories and optional raw stream dumps, which is good, but the profile directories still contain sensitive session data on disk.
+- The APIs have no authentication and should stay bound to `127.0.0.1`; do not expose them to a LAN or public network.
+- Prompts and conversation history are sent to provider websites using the logged-in browser session. Browser profiles hold sensitive session data and must not be committed or shared.
+- Tool calls are parsed and schema-validated against the current request but are returned to the calling agent; the bridge does not execute them. Keep the downstream tool approval policy enabled.
+- The code does not execute parsed model-generated JavaScript or Python and adds no evasion, account rotation, stealth, or provider risk-control bypass logic.
+- Provider website automation may break, may be restricted by provider terms, and may trigger account controls. This implementation cannot guarantee account safety.
 
-## Security and privacy findings
+## Correctness hardening in this release
 
-### 1. Tool calls are not checked against the request's allowed tools — **high priority**
+- Validation failures no longer echo Pydantic's submitted `input` values.
+- Unsupported text/image request content is rejected with HTTP 400 rather than an uncaught 500.
+- Non-streaming provider failures return an upstream error response rather than a false successful empty completion.
+- Regular OpenAI streaming chunks now use a consistent completion ID and send error events without a false success finish marker.
+- Queue overflow is handled as a controlled 429; queued cancellations remove their tickets, and active tickets release when responses complete, fail, or disconnect.
 
-`tool_bridge.py` describes a tool whitelist and filters tool descriptions sent to the model. But after parsing a returned call, it does not verify that the function name was included in the current request's `tools`, nor validate arguments against that function's JSON schema. A direct probe showed that a `shell_exec` tool name is parsed even though it is not in the whitelist. The bridge itself does not execute that call; it returns it to the calling agent/client, which may execute it. **Do not rely on the bridge's whitelist as a security boundary.** Validate every name and argument at the bridge/client boundary before execution.
+Known compatibility limits remain documented in `CLAUDE_CODE_SETUP.md`: text-only inputs, estimated token counts, incomplete generation-control support, no OpenAI Responses API, and probabilistic tool syntax because the model is prompted through a web interface rather than native function calling.
 
-The injected prompt also tells the model not to ask the user for confirmation. A downstream tool runner must retain its own permission checks and confirmation policy; it must not trust that prompt.
+## Verification
 
-### 2. Local API has no authentication — **medium priority**
+Offline checks in the workspace passed:
 
-The servers bind to `127.0.0.1` by default, which limits ordinary network exposure, but endpoints have no API-token check, rate limit, or meaningful request-size limit. Treat them as accessible to other local processes. Do not change the bind address or put them behind a network/reverse proxy without adding authentication and access controls.
+- `test_parser.py` — DeepSeek and Qwen parser assertions.
+- `test_tool_bridge.py` — 13 parser/validation/SSE tests.
+- `test_anthropic_compat.py` — 13 adapter tests.
+- `test_api_smoke.py` — both APIs, sanitized errors, unsupported input, fake provider failures, and stable streaming IDs.
+- `test_request_queue.py` — 4 FIFO, capacity, cancellation, rate pacing, and HTTP backpressure tests.
+- `test_startup_config.py` — 5 prompt-order, validation, environment override, and child-process configuration tests.
+- `python -m compileall -q .`, Ruff `check --select F,E9`, and `git diff --check`.
 
-### 3. Request bodies and provider session data are sensitive — **medium priority**
-
-- On request-validation failures, both server modules print the entire request body and include it in the 422 response. This can put prompts, private documents, or other user-supplied data in logs and error output.
-- Prompts and chat history are deliberately sent to DeepSeek or Qwen using the logged-in browser session. This is not a local-only inference path.
-- Enabling `DEBUG_DUMP` writes raw provider SSE data to disk. It is disabled by default, but dumps can contain private response content and should be treated as sensitive.
-
-Remove raw-body logging/echoing or redact it, and make debug dumps opt-in with explicit retention and permissions.
-
-### 4. Web automation is brittle and may have provider-policy implications
-
-The implementation relies on provider page selectors and private web-app completion endpoints, and includes random delays plus mouse/scroll activity described as human-like. Provider changes can break it, and this automation may conflict with provider terms or trigger account protections. Verify the applicable terms before using an account; an official API is more stable.
-
-### 5. No obvious arbitrary-code execution found in the reviewed source
-
-The `<run_code>` handling in `tool_bridge.py` parses strings with regular expressions; it does not execute JavaScript or Python. The only subprocess use found is `run_both.py` launching `server.py` and `qwen_server.py` from the project directory. This is a source-level observation, not a guarantee that dependencies or future revisions are safe.
-
-## Correctness and reliability findings
-
-### Tool-call parser limitations (reproduced)
-
-- **Split markers are missed.** If a stream chunk ends with `<tool_` and the next starts with `call>`, the first chunk is emitted as ordinary text and the tool call is not recognized.
-- **Only the first tagged tool block is accepted.** `Sieve` marks itself done after one `<tool_call>`/`<run_code>` block, so later separate call blocks are ignored.
-- **Bare JSON is not actually detected by the stream sieve.** There is a JSON parser helper, but the sieve never classifies untagged JSON as a JSON tool block; a JSON call is returned as assistant text.
-- **Nested JavaScript objects can be truncated.** The regular-expression parser for `tools.NAME({...})` stops at the first closing brace; a nested argument probe returned a malformed/truncated value.
-- `tool_choice="required"` is interpreted as though `required` were a function name, rather than as the OpenAI request to choose any available tool.
-
-These are functional defects as well as safety concerns. Add a streaming-safe parser and enforce the exact tool set and schema supplied on each request.
-
-### Browser/network response handling
-
-- The response handler buffers the provider's entire stream in memory before fulfilling the browser route, while also queuing chunks for the API client. There is no explicit total-response size cap or queue back-pressure.
-- `STREAM_TIMEOUT_S` applies once HTTPX is reading a provider response. If the browser action fails or the expected completion request is never intercepted, `stream_response()` can wait indefinitely on the queue; there is no timeout around that wait.
-- The code reads with `httpx.Response.aiter_bytes()` (decoded bytes) but forwards the provider response headers unchanged. For compressed responses, stale `content-encoding` or `content-length` headers can make the fulfilled browser response inconsistent with its body.
-- DeepSeek provider error/status payloads are not handled as comprehensively as Qwen's; some errors can become an empty or incomplete answer.
-- Tool-mode handling collects a whole model turn before returning chunks, so `stream: true` is not genuinely live for tool-enabled requests.
-
-### API compatibility limitations
-
-- System, user, assistant, and tool messages are flattened into text labels such as `[SYSTEM]` and `[USER]`; they are not preserved as separate provider roles. “Full passthrough” is therefore approximate, and the system instruction does not retain a separate high-priority role at the web provider.
-- Image content is unsupported. The shared text extractor raises for image content; the plain-chat endpoint does not consistently convert that into a clean 400 response.
-- `temperature`, `max_tokens`, and `stream_options.include_usage` are accepted but not applied. Some clients may also expect one stable completion ID across all streamed chunks; this implementation creates new IDs in several chunk helpers.
-- Startup asks for prompt mode while importing the server module. Running as `python server.py` is the intended path; importing it through a generic ASGI command can prompt/block unexpectedly.
-
-## Checks performed
-
-| Check | Result |
-|---|---|
-| Python compilation (`compileall`) | Passed |
-| Direct `python test_parser.py` | **Failed** before tests: the fake `playwright.async_api` module in the test file omits `TimeoutError`, which `app.py` imports |
-| Existing DeepSeek/Qwen parser assertions with an in-memory test-only shim for that missing fake attribute | Passed: all 10 included scenarios |
-| Focused tool-sieve probes | Reproduced the split-marker, multi-block, unvalidated-name, bare-JSON, and nested-object issues described above |
-| `pip-audit -r requirements.txt` against the current unpinned resolution | No known vulnerable dependency versions reported at review time; this does not audit application logic or guarantee future resolutions |
-| Live browser/provider test | Not run; no Chromium browser or account session was installed/used |
-
-The repository's test script currently cannot run unmodified, and it has no tests for `tool_bridge.py`, the HTTP endpoints, cancellation/timeouts, or browser-route fulfillment.
-
-## Packaging and maintenance gaps
-
-There is no README, license file, `pyproject.toml`/`setup.py`, or lockfile. This is not a standard `pip install .` package; installation is manual (`pip install -r requirements.txt`, then install a compatible Playwright browser). Dependency versions are unconstrained and Python/browser requirements are undocumented. No CI configuration was present in the reviewed file set.
-
-If you want to finish the setup on a desktop computer, use Python 3.10+ and run from the repository directory:
-
-```bash
-python -m venv .venv
-# Linux/macOS:
-. .venv/bin/activate
-# Windows PowerShell instead:
-# .\\.venv\\Scripts\\Activate.ps1
-python -m pip install -r requirements.txt
-python -m playwright install chromium
-PROMPT_MODE=full python server.py
-```
-
-On Windows PowerShell, set the mode with `$env:PROMPT_MODE='full'` before `python server.py`. For Qwen, launch `python qwen_server.py` instead (default port 8001). The program opens a visible browser and waits for manual login; it is not configured for unattended/headless operation by default.
-
-## Recommended order of fixes
-
-1. Validate parsed tool names against the exact `req.tools` list and validate arguments against their schemas before returning any tool call; reject unknown calls. Handle `tool_choice="required"` correctly.
-2. Fix the Playwright test stub and add tests for split SSE markers, multiple calls, malformed/incomplete blocks, bare JSON, nested arguments, unknown tools, and both streaming/non-streaming API responses.
-3. Add total timeouts around browser submission and queue reads; impose prompt/response limits and queue back-pressure.
-4. Normalize response headers before `route.fulfill()` (or preserve raw encoded bytes consistently), and check provider HTTP status/error payloads.
-5. Remove request-body logging/echoing; add an optional API token and keep the server loopback-only by default.
-6. Document Python/browser setup, provider data flow, terms/privacy caveats, supported content, and limitations; pin dependencies or provide a lockfile and add an explicit license.
-7. Prefer official provider APIs for production use.
-
-## Bottom line
-
-The isolated Python dependencies were installed in the workspace, but the full browser bridge was **not** installed or verified on a user's machine. The code is an experimental browser-session relay, not a private/local model server. It may be useful for controlled testing, but the tool parser, request handling, documentation, and test coverage need work before trusting it with sensitive data or agent tools.
+All provider streams in these tests are fake. No live Playwright login, DeepSeek/Qwen web session, Claude Code call, account-specific rate-limit validation, or current provider website behavior has been tested. Do not treat offline tests as proof of live service reliability.
 ````
