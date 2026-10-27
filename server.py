@@ -4,28 +4,29 @@ server.py – OpenAI-compatible API server for the DeepSeek Bridge
 Runs on port 8000 by default. To change:  set DEEPSEEK_PORT env var, e.g.
     DEEPSEEK_PORT=8010 python server.py
 
-HYBRID (full passthrough + tool calling):
-  - PLAIN CHAT (no tools): the FULL original request (system + all messages,
-    in order, roles labelled) is rendered and sent to the web AI exactly as
-    received — nothing dropped, nothing refined.
-  - TOOL REQUESTS (tools present): same full passthrough PLUS a small
-    whitelisted tool block is appended, and the stream is sieved so the web
-    model's <tool_call> reply is converted into real OpenAI tool_calls that
-    DSH executes. Tool results round-trip as [TOOL RESULT (name)] turns.
+Exposes the existing OpenAI-compatible Chat Completions API and a minimum
+Anthropic Messages adapter for Claude Code/custom Anthropic-format clients.
+Tool calls are returned to the client for approval/execution; this server does
+not run client tools.
 """
-import asyncio
 import json
 import os
 import time
 import uuid
 from typing import Any, Optional
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, Response
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
 import uvicorn
 import app          # the DeepSeek bridge module (app.py)
-import tool_bridge  # the hybrid tool-calling module (tool_bridge.py)
+import tool_bridge  # the shared OpenAI/tool-calling bridge
+from anthropic_compat import (
+    AnthropicCountTokensRequest,
+    AnthropicMessagesRequest,
+    handle_count_tokens,
+    handle_messages,
+)
 
 # ==================== Port ====================
 PORT = int(os.environ.get("DEEPSEEK_PORT", "8000"))
@@ -100,7 +101,8 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     stream_options: Optional[StreamOptions] = None
     tools: Optional[list] = None          # OpenAI tools array (hybrid path)
-    tool_choice: Optional[Any] = None     # "auto" | "none" | {"function": {...}}
+    tool_choice: Optional[Any] = None     # "auto" | "none" | "required" | {"function": {...}}
+    parallel_tool_calls: Optional[bool] = None
 
 # ==================== Lifespan ====================
 @api.on_event("startup")
@@ -108,8 +110,10 @@ async def startup():
     await app.startup()
     print("\n" + "=" * 60)
     print(f"  DeepSeek Bridge API running at http://127.0.0.1:{PORT}")
-    print("  Endpoint: POST /v1/chat/completions")
-    print(f"  Base URL for agent: http://127.0.0.1:{PORT}/v1")
+    print("  OpenAI endpoint: POST /v1/chat/completions")
+    print("  Anthropic endpoint: POST /v1/messages")
+    print(f"  OpenAI base URL: http://127.0.0.1:{PORT}/v1")
+    print(f"  Claude Code base URL: http://127.0.0.1:{PORT}")
     print("  Mode: full passthrough + tool calling (tool_bridge.py)")
     print(f"  Prompt mode: {PROMPT_MODE}")
     print("=" * 60 + "\n")
@@ -134,20 +138,30 @@ async def list_models():
 # ==================== Validation error logger ====================
 @api.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    body = await request.body()
-    print(f"[VALIDATION ERROR] {exc.errors()}")
-    print(f"[REQUEST BODY] {body.decode()}")
-    return JSONResponse(status_code=422, content={"detail": exc.errors(), "body": body.decode()})
+    # Never log or echo the submitted prompt/tool payload on validation errors.
+    print(f"[VALIDATION ERROR] {request.url.path}: {len(exc.errors())} field error(s)")
+    if request.url.path.startswith("/v1/messages"):
+        return JSONResponse(
+            status_code=422,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "Invalid Anthropic Messages request.",
+                },
+            },
+        )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 # ==================== Chat completions ====================
 @api.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest):
-    # ---- Hybrid tool path: only when tools are present ----
-    if getattr(req, "tools", None):
+    # ---- Hybrid tool path: when tools or tool_choice are supplied ----
+    if req.tools is not None or req.tool_choice is not None:
         result = await tool_bridge.handle_chat(req, bridge=app)
         if result is not None:
             return result
-        # fall through to plain path if handle_chat returned None (tool_choice none)
+        # fall through for tool_choice=none, or auto with no tools
 
     if not req.messages:
         return JSONResponse(status_code=400, content={"error": "No messages provided."})
@@ -211,6 +225,36 @@ async def chat_completions(req: ChatCompletionRequest):
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+# ==================== Anthropic Messages API ====================
+@api.post("/v1/messages")
+async def anthropic_messages(req: AnthropicMessagesRequest):
+    response = await handle_messages(req, bridge=app, default_model="deepseek-chat")
+    if isinstance(response, JSONResponse) and response.status_code == 400:
+        # The adapter returns an Anthropic error body; log its reason without the request.
+        try:
+            message = json.loads(response.body.decode("utf-8"))["error"]["message"]
+            print(f"[ANTHROPIC 400] request rejected: {message}")
+        except Exception:
+            pass
+    return response
+
+
+@api.post("/v1/messages/count_tokens")
+async def anthropic_count_tokens(req: AnthropicCountTokensRequest):
+    return handle_count_tokens(req)
+
+
+# ==================== Client connectivity probes ====================
+@api.get("/api/hello")
+async def api_hello():
+    return {"status": "ok"}
+
+
+@api.head("/api/hello")
+async def api_hello_head():
+    return Response(status_code=200)
+
 
 # ==================== Health check ====================
 @api.get("/health")

@@ -29,6 +29,7 @@ import types
 fake_module = types.ModuleType("playwright")
 fake_async_api = types.ModuleType("playwright.async_api")
 fake_async_api.async_playwright = lambda: None
+fake_async_api.TimeoutError = TimeoutError
 sys.modules["playwright"] = fake_module
 sys.modules["playwright.async_api"] = fake_async_api
 

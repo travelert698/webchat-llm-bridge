@@ -3,3 +3,4 @@ uvicorn[standard]
 playwright
 pydantic
 httpx
+jsonschema>=4.23,<5

@@ -39,10 +39,13 @@ def main():
         start_server("Qwen", "qwen_server.py", "QWEN_PORT", 8001),
     ]
     print("\nBoth bridges are starting. Log in to each browser when it opens,")
-    print("then point Continue at:")
+    print("OpenAI-compatible clients (for example, Continue):")
     print("  DeepSeek: http://127.0.0.1:8000/v1  (model deepseek-chat)")
     print("  Qwen:     http://127.0.0.1:8001/v1  (model qwen-auto)")
-    print("Press Ctrl+C here to stop both.\n")
+    print("Claude Code / Anthropic Messages base URL (choose one backend per session):")
+    print("  DeepSeek: http://127.0.0.1:8000")
+    print("  Qwen:     http://127.0.0.1:8001")
+    print("Set ANTHROPIC_BASE_URL to the selected URL. Press Ctrl+C here to stop both.\n")
 
     try:
         while True:
