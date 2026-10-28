@@ -1,8 +1,8 @@
 """Start both browser-backed bridge APIs from one console.
 
 DeepSeek listens on 127.0.0.1:8000 and Qwen on 127.0.0.1:8001. The
-supervisor collects the shared prompt mode and each backend's own RPM choice,
-then passes the settings to child processes so prompts never race on stdin.
+supervisor collects the shared prompt mode and each backend's own completion
+cooldown in seconds, then passes settings to children so prompts never race on stdin.
 """
 from __future__ import annotations
 
@@ -12,9 +12,9 @@ import sys
 import time
 
 from startup_config import (
+    choose_delay_seconds,
     choose_max_pending,
     choose_prompt_mode,
-    choose_rpm,
     environment_for_child,
 )
 
@@ -51,20 +51,20 @@ def _stop_processes(names: list[str], procs: list[subprocess.Popen]) -> None:
 
 def main() -> None:
     prompt_mode = choose_prompt_mode()
-    deepseek_rpm = choose_rpm("deepseek")
-    qwen_rpm = choose_rpm("qwen")
+    deepseek_delay = choose_delay_seconds("deepseek")
+    qwen_delay = choose_delay_seconds("qwen")
     deepseek_pending = choose_max_pending("deepseek")
     qwen_pending = choose_max_pending("qwen")
 
     deepseek_env = environment_for_child(
-        "deepseek", prompt_mode, deepseek_rpm, deepseek_pending
+        "deepseek", prompt_mode, deepseek_delay, deepseek_pending
     )
-    qwen_env = environment_for_child("qwen", prompt_mode, qwen_rpm, qwen_pending)
+    qwen_env = environment_for_child("qwen", prompt_mode, qwen_delay, qwen_pending)
 
-    print("\nStarting both bridges with independent provider queues:")
+    print("\nStarting both bridges with independent FIFO queues:")
     print(f"  Prompt mode: {prompt_mode}")
-    print(f"  DeepSeek: {deepseek_rpm} provider requests/min, {deepseek_pending} pending slots")
-    print(f"  Qwen:     {qwen_rpm} provider requests/min, {qwen_pending} pending slots")
+    print(f"  DeepSeek: {deepseek_delay:g}s completion cooldown, {deepseek_pending} pending slots")
+    print(f"  Qwen:     {qwen_delay:g}s completion cooldown, {qwen_pending} pending slots")
 
     names: list[str] = []
     procs: list[subprocess.Popen] = []

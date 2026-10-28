@@ -4,7 +4,7 @@ qwen_server.py – OpenAI-compatible API server for the Qwen Bridge
 Runs on port 8001 by default (DeepSeek server.py keeps port 8000).
 To change: set QWEN_PORT env var, e.g.
     QWEN_PORT=8020 python qwen_server.py
-Interactive startup asks for prompt mode, then a provider-submission RPM limit.
+Interactive startup asks for prompt mode, then a completion-to-next-request delay in seconds.
 Generation requests are queued FIFO; see /queue/status for queue statistics.
 
 Exposes the existing OpenAI-compatible Chat Completions API and a minimum
@@ -34,26 +34,26 @@ from startup_config import choose_startup_config
 
 # ==================== Port and startup configuration ====================
 PORT = int(os.environ.get("QWEN_PORT", "8001"))
-PROMPT_MODE, RATE_LIMIT_RPM, MAX_PENDING_REQUESTS = choose_startup_config("qwen")
+PROMPT_MODE, INTER_REQUEST_DELAY_SECONDS, MAX_PENDING_REQUESTS = choose_startup_config("qwen")
 tool_bridge.PROMPT_MODE = PROMPT_MODE   # sync the global tool-bridge mode
 
-# ==================== Bounded client queue + provider pacing ====================
+# ==================== Bounded client queue + completion cooldown ====================
 REQUEST_QUEUE = RequestQueue(
-    requests_per_minute=RATE_LIMIT_RPM,
+    inter_request_delay_seconds=INTER_REQUEST_DELAY_SECONDS,
     max_pending=MAX_PENDING_REQUESTS,
 )
 _original_stream_response = app.stream_response
 
 
-async def _rate_limited_stream_response(prompt: str):
-    """Gate every underlying web-model submission, including tool retries."""
-    await REQUEST_QUEUE.wait_for_provider_start()
-    async for chunk in _original_stream_response(prompt):
-        yield chunk
+async def _serialized_stream_response(prompt: str):
+    """Hold the provider slot for the whole response and cooldown afterward."""
+    async with REQUEST_QUEUE.provider_call():
+        async for chunk in _original_stream_response(prompt):
+            yield chunk
 
 
 # All plain chat, tool-bridge, and Anthropic adapter calls share this wrapper.
-app.stream_response = _rate_limited_stream_response
+app.stream_response = _serialized_stream_response
 
 # ==================== FastAPI app ====================
 api = FastAPI(title="Qwen Bridge API")
@@ -121,7 +121,7 @@ async def startup():
     print("  Model: qwen-auto")
     print("  Mode: full passthrough + tool calling (tool_bridge.py)")
     print(f"  Prompt mode: {PROMPT_MODE}")
-    print(f"  Provider submission limit: {RATE_LIMIT_RPM} per rolling minute (smoothed)")
+    print(f"  Completion cooldown: {INTER_REQUEST_DELAY_SECONDS:g} seconds")
     print(f"  FIFO client queue: 1 active + {MAX_PENDING_REQUESTS} waiting")
     print("  Queue status: GET /queue/status")
     print("=" * 60 + "\n")

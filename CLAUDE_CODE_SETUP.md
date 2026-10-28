@@ -12,7 +12,7 @@ Copy/replace these complete runtime files in the project root:
 - `tool_bridge.py` — request-scoped tool formatting, parsing, and JSON Schema validation.
 - `requirements.txt` — adds `jsonschema` for tool-input validation.
 
-`app.py` and `qwen_app.py` are unchanged. `run_both.py` only changes its printed endpoint hints and is optional. The test files and this guide are not needed to run the bridge.
+`app.py` and `qwen_app.py` preserve the visible browser/UI automation. `run_both.py` starts both backends and collects their startup settings. The test files and this guide are not needed to run the bridge.
 
 Install updated dependencies after replacing the files:
 
@@ -22,7 +22,7 @@ python -m pip install -r requirements.txt
 
 ## Run the bridge and configure the queue
 
-Start either server in a console. By default it asks for the prompt mode first, then asks for a positive provider-submission limit per minute (Enter accepts the conservative default of 5):
+Start either server in a console. By default it asks for the prompt mode first, then asks how many **seconds to wait after a completed provider response before the next provider submission**. Enter accepts the default of 3 seconds; values from 0 to 300 seconds are accepted.
 
 ```powershell
 python server.py       # DeepSeek, port 8000
@@ -30,27 +30,27 @@ python server.py       # DeepSeek, port 8000
 python qwen_server.py  # Qwen, port 8001
 ```
 
-The RPM value paces **outbound browser-backed model submissions**, not just client HTTP requests. Each tool-call repair attempt also counts. The prompt is a local safety setting; it cannot discover or override the provider's own web-chat limits.
+The cooldown starts after the provider stream ends, not when the request starts. It also applies between internal tool-repair submissions. Separately, the client-request gate starts its cooldown only after the full HTTP response is sent—so an SSE response must finish streaming to the coding agent before the next queued client generation can begin.
 
-For non-interactive launches, set environment variables instead. On an interactive terminal, valid environment values prefill the prompts; the console still asks unless a supervisor has already chosen the settings. Provider-specific values take precedence over `BRIDGE_RPM` and `RATE_LIMIT_RPM`:
+For non-interactive launches, set environment variables instead. On an interactive terminal, valid environment values prefill the prompts; the console still asks unless a supervisor has already chosen the settings. Provider-specific values take precedence over `BRIDGE_DELAY_SECONDS` and `REQUEST_DELAY_SECONDS`:
 
 ```powershell
 # DeepSeek
-$env:PROMPT_MODE = 'full'       # or 'user_only'
-$env:DEEPSEEK_RPM = '5'
+$env:PROMPT_MODE = 'full'                  # or 'user_only'
+$env:DEEPSEEK_DELAY_SECONDS = '3'
 python server.py
 
 # Qwen
 $env:PROMPT_MODE = 'full'
-$env:QWEN_RPM = '5'
+$env:QWEN_DELAY_SECONDS = '3'
 python qwen_server.py
 ```
 
-The client queue is on by default. Each server runs one browser-backed generation at a time in FIFO order, then paces provider starts against a rolling 60-second window without a startup burst. By default, up to 100 additional generation requests may wait; change this with `DEEPSEEK_MAX_QUEUE`, `QWEN_MAX_QUEUE`, or the shared `BRIDGE_MAX_QUEUE` environment variable. `GET /queue/status` reports queue depth and recent provider starts.
+The client queue is on by default. Each server runs one generation at a time in FIFO order and holds that slot through the entire response stream. Up to 100 additional generation requests may wait; change this with `DEEPSEEK_MAX_QUEUE`, `QWEN_MAX_QUEUE`, or the shared `BRIDGE_MAX_QUEUE` environment variable. `GET /queue/status` reports the number waiting, active response time, provider-stream state, and remaining cooldowns.
 
-No finite machine can safely hold an unlimited backlog. If all pending slots are occupied, the bridge returns a structured HTTP 429 `queue_full` response instead of growing memory without bound or crashing. Clients should back off before retrying; while the process remains up, accepted requests stay queued rather than being silently discarded. The in-memory queue is not durable: a process crash/restart can interrupt queued work. The cap is configurable from 1 to 10,000 pending requests.
+No finite machine can safely hold an unlimited backlog. If all pending slots are occupied, the bridge returns a structured HTTP 429 `queue_full` response instead of growing memory without bound or crashing. Clients should back off before retrying. The in-memory queue is not durable: a process crash/restart can interrupt queued work. The queue cap is configurable from 1 to 10,000 pending requests.
 
-`run_both.py` asks for the prompt mode and independent DeepSeek/Qwen RPM values in its own console, then passes those settings to each child process. This avoids two child processes racing to read the same terminal input.
+`run_both.py` asks for the prompt mode and independent DeepSeek/Qwen cooldown values in seconds in its own console, then passes those settings to each child process. This avoids two child processes racing to read the same terminal input.
 
 Start Claude Code in a second terminal with the base URL set to the server root (do not append `/v1`):
 
@@ -72,7 +72,20 @@ The DeepSeek/Qwen bridges open a visible browser and wait for manual login. Brow
 - Qwen: `POST http://127.0.0.1:8001/v1/messages`, optional `/v1/messages/count_tokens`.
 - Existing OpenAI route remains `POST /v1/chat/completions` on both servers.
 - `GET` and `HEAD /api/hello` are lightweight client connectivity probes; `/health` remains available.
-- `GET /queue/status` reports FIFO queue depth, active request time, RPM pacing, and local counters.
+- `GET /queue/status` reports FIFO queue depth, active request/stream time, cooldowns, and local counters.
+
+## Troubleshooting a DeepSeek/Qwen browser “Network Error”
+
+The browser route handler relays the provider response through HTTPX and then replays it to the visible page. HTTPX decodes compressed response bodies while reading them; the bridge therefore strips stale `Content-Encoding`, `Content-Length`, and hop-by-hop headers before replaying the body. The coding-client stream and the browser page replay are separate paths, so a successful coding-client response does not by itself prove that the browser's own fetch completed correctly.
+
+The server console now reports safe replay metadata for each intercepted completion: upstream status/content type/encoding, decoded byte count, whether a `[DONE]` marker was seen, and whether the page route was fulfilled or aborted. It does not log prompts, response text, cookies, or browser session data. In particular:
+
+- `route=fulfilled` means Playwright accepted the normalized replay; if the page still reports an error, note the status/type/encoding/done-marker line.
+- `route=aborted_client_cancel` means the calling API client disconnected or cancelled the stream, so the bridge stopped the browser generation.
+- `route=aborted_upstream_error` means the provider relay failed before a complete response could be replayed; inspect the adjacent interception error line.
+- `route=fulfill_failed:...` means the browser rejected the replay operation; share only that sanitized diagnostic line when troubleshooting.
+
+These diagnostics and the compressed-response tests are offline checks. They cannot certify the live provider website's current behavior or account/session state.
 
 ## Tool-calling model and limitations
 
@@ -93,6 +106,9 @@ python test_parser.py
 python test_tool_bridge.py
 python test_anthropic_compat.py
 python test_api_smoke.py
+python test_browser_response.py
+python test_request_queue.py
+python test_startup_config.py
 ```
 
-These use fake streams and validate the existing DeepSeek/Qwen stream parsers, tool-call parsing/validation and both API routes, Anthropic/OpenAI SSE framing, and tool-choice behavior. They do not verify live provider selectors, browser logins, or current DeepSeek/Qwen website behavior.
+These use fake streams and validate the DeepSeek/Qwen stream parsers, compressed-response replay headers, tool-call parsing/validation and both API routes, Anthropic/OpenAI SSE framing, queue/cooldown behavior, and startup choices. They do not verify live provider selectors, browser logins, or current DeepSeek/Qwen website behavior.

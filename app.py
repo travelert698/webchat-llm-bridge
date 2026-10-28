@@ -21,12 +21,15 @@ FIXED v3. What changed in this version:
 6. INCREMENTAL UTF-8 DECODER -> no more "�" from split multi-byte characters.
 7. TAIL LINE FLUSHED, CLIENT-DISCONNECT ABORT, IDLE SIMULATION FIX, 300s TIMEOUT
    (unchanged from v2).
+8. RESPONSE REPLAY HEADERS -> HTTPX-decoded SSE bodies are replayed without stale
+   Content-Encoding/Content-Length/hop-by-hop headers that could break browser fetch.
 """
 import asyncio
 import codecs
 import json
 import random
 import time
+from collections.abc import Mapping
 import httpx
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -45,6 +48,71 @@ STREAM_TIMEOUT_S = 300.0
 SEND_THINKING = True     # True -> thinking streamed as delta.reasoning_content
 DEBUG_DUMP = False       # True -> write raw SSE data lines to DUMP_FILE
 DUMP_FILE = "deepseek_stream_dump.jsonl"
+
+# HTTPX's ``aiter_bytes()`` transparently decompresses content-encoded bodies.
+# When those decoded bytes are replayed to Chromium, upstream framing/encoding
+# headers must not be copied unchanged or the browser can report a Network Error.
+_HOP_BY_HOP_HEADERS = frozenset({
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
+})
+_RECOMPUTED_BODY_HEADERS = frozenset({
+    "content-encoding", "content-length", "content-md5", "digest", "repr-digest",
+})
+_REQUEST_HEADERS_TO_REGENERATE = frozenset({"host", "content-length", "accept-encoding"})
+
+
+def _headers_for_httpx_request(headers: Mapping[str, str]) -> dict[str, str]:
+    """Let HTTPX set its own host, body length, and supported encoding list."""
+    return {
+        str(name): str(value)
+        for name, value in headers.items()
+        if str(name).lower() not in _REQUEST_HEADERS_TO_REGENERATE
+    }
+
+
+def _headers_for_replayed_body(headers: Mapping[str, str]) -> dict[str, str]:
+    """Filter headers that no longer describe an HTTPX-decoded replay body."""
+    normalized = {str(name): str(value) for name, value in headers.items()}
+    connection_tokens = {
+        token.strip().lower()
+        for name, value in normalized.items()
+        if name.lower() == "connection"
+        for token in value.split(",")
+        if token.strip()
+    }
+    blocked = _HOP_BY_HOP_HEADERS | _RECOMPUTED_BODY_HEADERS | connection_tokens
+    return {
+        name: value
+        for name, value in normalized.items()
+        if name.lower() not in blocked
+    }
+
+
+async def _fulfill_decoded_response(route, body: bytes, status: int, headers: Mapping[str, str]) -> None:
+    """Replay decoded response bytes with only headers that still apply."""
+    await route.fulfill(
+        body=body,
+        status=status,
+        headers=_headers_for_replayed_body(headers),
+    )
+
+
+def _log_response_replay(
+    status: int,
+    headers: Mapping[str, str],
+    decoded_bytes: int,
+    done_seen: bool,
+    outcome: str,
+) -> None:
+    """Log transport metadata only; never log prompts, cookies, or body text."""
+    content_type = str(headers.get("content-type", "unknown"))[:80].replace("\r", "").replace("\n", "")
+    encoding = str(headers.get("content-encoding", "identity"))[:40].replace("\r", "").replace("\n", "")
+    print(
+        f"[DeepSeek Bridge] replay status={status} content_type={content_type!r} "
+        f"encoding={encoding!r} decoded_bytes={decoded_bytes} "
+        f"done_marker={done_seen} route={outcome}"
+    )
 
 # Per-turn route state
 _armed = asyncio.Event()
@@ -341,9 +409,9 @@ async def _register_route():
             _intercepted = True
 
         request = route.request
-        headers = await request.all_headers()
-        headers.pop("content-length", None)
-        headers.pop("host", None)
+        # The body is JSON-reserialized and HTTPX should advertise only encodings
+        # its installed decoders can handle (not Chromium's possibly broader list).
+        headers = _headers_for_httpx_request(await request.all_headers())
         cookies = {c["name"]: c["value"] for c in await browser.cookies()}
         body = request.post_data_json
         if body is None:
@@ -352,9 +420,10 @@ async def _register_route():
             return
 
         full_body = bytearray()
-        resp_headers = {}
+        resp_headers: dict[str, str] = {}
         response_status = 200
         done_seen = False
+        upstream_failed = False
         decoder = codecs.getincrementaldecoder("utf-8")()
         buffer = ""
 
@@ -406,7 +475,8 @@ async def _register_route():
                                 except Exception:
                                     pass
         except Exception as e:
-            print(f"[Bridge] Interception error: {e}")
+            upstream_failed = True
+            print(f"[Bridge] Interception error ({type(e).__name__}): {e}")
             if _current_queue is not None:
                 await _current_queue.put(_make_error_sse(f"Interception error: {e}"))
         finally:
@@ -419,10 +489,37 @@ async def _register_route():
             await _click_stop_button()
             try:
                 await route.abort()
-            except Exception:
-                pass
+                outcome = "aborted_client_cancel"
+            except Exception as e:
+                outcome = f"abort_failed:{type(e).__name__}"
+                print(f"[Bridge] route abort failed ({type(e).__name__}): {e}")
+        elif upstream_failed:
+            # Do not replay a partial response with a misleading success status.
+            try:
+                await route.abort()
+                outcome = "aborted_upstream_error"
+            except Exception as e:
+                outcome = f"abort_failed:{type(e).__name__}"
+                print(f"[Bridge] route abort after upstream error failed ({type(e).__name__}): {e}")
         else:
-            await route.fulfill(body=bytes(full_body), status=response_status, headers=resp_headers)
+            try:
+                await _fulfill_decoded_response(
+                    route, bytes(full_body), response_status, resp_headers
+                )
+                outcome = "fulfilled"
+            except Exception as e:
+                outcome = f"fulfill_failed:{type(e).__name__}"
+                print(f"[Bridge] browser response replay failed ({type(e).__name__}): {e}")
+                try:
+                    await route.abort()
+                except Exception as abort_error:
+                    print(
+                        f"[Bridge] route abort after replay failure failed "
+                        f"({type(abort_error).__name__}): {abort_error}"
+                    )
+        _log_response_replay(
+            response_status, resp_headers, len(full_body), done_seen, outcome
+        )
 
     await page.route(COMPLETION_GLOB, handle_route)
     await page.route(REGENERATE_GLOB, handle_route)

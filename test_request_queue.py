@@ -1,25 +1,14 @@
-"""FIFO queue, RPM pacing, cancellation, and HTTP back-pressure tests."""
+"""FIFO queue, post-completion cooldown, cancellation, and HTTP backpressure tests."""
 from __future__ import annotations
 
 import asyncio
+import time
 import unittest
 
 import httpx
 from fastapi import FastAPI
 
 from request_queue import RequestQueue, RequestQueueFull, RequestQueueMiddleware
-
-
-class FakeClock:
-    def __init__(self) -> None:
-        self.value = 0.0
-
-    def now(self) -> float:
-        return self.value
-
-    async def sleep(self, delay: float) -> None:
-        self.value += delay
-        await asyncio.sleep(0)
 
 
 class RequestQueueTests(unittest.IsolatedAsyncioTestCase):
@@ -30,19 +19,64 @@ class RequestQueueTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
         self.fail(f"queue did not reach pending={expected}")
 
-    async def test_provider_starts_are_smoothed_and_rolling_window_bounded(self):
-        clock = FakeClock()
-        queue = RequestQueue(2, clock=clock.now, sleep=clock.sleep)
+    async def test_provider_cooldown_starts_after_stream_completion(self):
+        delay = 0.05
+        queue = RequestQueue(inter_request_delay_seconds=delay)
+        first = await queue.acquire_provider_call()
+        waiting = asyncio.create_task(queue.acquire_provider_call())
+        await asyncio.sleep(0.01)
+        self.assertFalse(waiting.done())
 
-        starts = [await queue.wait_for_provider_start() for _ in range(3)]
+        released_at = time.monotonic()
+        await first.release()
+        second = await asyncio.wait_for(waiting, timeout=1)
+        elapsed = time.monotonic() - released_at
+        self.assertGreaterEqual(elapsed, delay - 0.01)
+        await second.release()
 
-        self.assertEqual(starts, [0.0, 30.0, 60.0])
         status = await queue.snapshot()
-        self.assertEqual(status["provider_requests_started_last_60_seconds"], 2)
-        self.assertEqual(status["total_provider_requests_started"], 3)
+        self.assertEqual(status["provider_calls_started"], 2)
+        self.assertEqual(status["provider_calls_completed"], 2)
+
+    async def test_client_cooldown_begins_after_response_slot_releases(self):
+        delay = 0.05
+        queue = RequestQueue(inter_request_delay_seconds=delay)
+        first = await queue.acquire_request()
+        await first.release()
+
+        released_at = time.monotonic()
+        second = await queue.acquire_request()
+        elapsed = time.monotonic() - released_at
+        self.assertGreaterEqual(elapsed, delay - 0.01)
+        await second.release()
+
+    async def test_asgi_client_cooldown_begins_after_full_response(self):
+        delay = 0.05
+        queue = RequestQueue(inter_request_delay_seconds=delay)
+        app = FastAPI()
+        app.add_middleware(RequestQueueMiddleware, queue=queue)
+        completed: list[int] = []
+
+        @app.post("/v1/chat/completions")
+        async def chat():
+            completed.append(len(completed) + 1)
+            return {"turn": completed[-1]}
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            first = await client.post("/v1/chat/completions", json={"turn": 1})
+            self.assertEqual(first.status_code, 200)
+            response_finished_at = time.monotonic()
+            second = await client.post("/v1/chat/completions", json={"turn": 2})
+            elapsed = time.monotonic() - response_finished_at
+
+        self.assertEqual(second.status_code, 200)
+        self.assertGreaterEqual(elapsed, delay - 0.01)
+        self.assertEqual(completed, [1, 2])
 
     async def test_fifo_order_and_bounded_waiting_capacity(self):
-        queue = RequestQueue(60, max_pending=2)
+        queue = RequestQueue(inter_request_delay_seconds=0, max_pending=2)
         first = await queue.acquire_request()
         order: list[str] = []
 
@@ -70,7 +104,7 @@ class RequestQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["completed_requests"], 3)
 
     async def test_cancelled_waiter_is_removed_and_does_not_block_queue(self):
-        queue = RequestQueue(60, max_pending=2)
+        queue = RequestQueue(inter_request_delay_seconds=0, max_pending=2)
         active = await queue.acquire_request()
 
         async def wait_forever() -> None:
@@ -88,7 +122,7 @@ class RequestQueueTests(unittest.IsolatedAsyncioTestCase):
         await active.release()
 
     async def test_asgi_middleware_queues_and_returns_protocol_specific_429(self):
-        queue = RequestQueue(60, max_pending=1)
+        queue = RequestQueue(inter_request_delay_seconds=0, max_pending=1)
         app = FastAPI()
         app.add_middleware(RequestQueueMiddleware, queue=queue)
         first_entered = asyncio.Event()

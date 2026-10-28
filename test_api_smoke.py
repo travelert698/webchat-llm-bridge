@@ -12,8 +12,8 @@ import unittest
 import httpx
 
 os.environ.setdefault("PROMPT_MODE", "full")
-os.environ.setdefault("DEEPSEEK_RPM", "5")
-os.environ.setdefault("QWEN_RPM", "5")
+os.environ.setdefault("DEEPSEEK_DELAY_SECONDS", "0")
+os.environ.setdefault("QWEN_DELAY_SECONDS", "0")
 import server  # noqa: E402
 import qwen_server  # noqa: E402
 
@@ -55,20 +55,20 @@ async def _fake_error_stream(prompt: str):
 class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.servers = [
-            (server.api, server.app, "deepseek-chat"),
-            (qwen_server.api, qwen_server.app, "qwen-auto"),
+            (server.api, server, "deepseek-chat"),
+            (qwen_server.api, qwen_server, "qwen-auto"),
         ]
-        self.original_streams = []
-        for _, bridge, _ in self.servers:
-            self.original_streams.append(bridge.stream_response)
-            bridge.stream_response = _fake_stream_response
+        self.original_stream_handlers = []
+        for _, module, _ in self.servers:
+            self.original_stream_handlers.append(module._original_stream_response)
+            module._original_stream_response = _fake_stream_response
 
     async def asyncTearDown(self):
-        for (_, bridge, _), original in zip(self.servers, self.original_streams):
-            bridge.stream_response = original
+        for (_, module, _), original in zip(self.servers, self.original_stream_handlers):
+            module._original_stream_response = original
 
     async def test_messages_openai_and_tool_routes_for_both_servers(self):
-        for api, bridge, backend_model in self.servers:
+        for api, module, backend_model in self.servers:
             async with httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=api),
                 base_url="http://test",
@@ -107,7 +107,12 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
                 queue_status = await client.get("/queue/status")
                 self.assertEqual(queue_status.status_code, 200, queue_status.text)
                 self.assertEqual(queue_status.json()["pending"], 0)
-                self.assertEqual(queue_status.json()["requests_per_minute"], 5)
+                self.assertEqual(queue_status.json()["inter_request_delay_seconds"], 0.0)
+                self.assertGreater(queue_status.json()["provider_calls_started"], 0)
+                self.assertEqual(
+                    queue_status.json()["provider_calls_completed"],
+                    queue_status.json()["provider_calls_started"],
+                )
 
                 invalid_content = await client.post("/v1/chat/completions", json={
                     "messages": [{"role": "user", "content": [
@@ -123,7 +128,7 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(invalid_body.status_code, 422, invalid_body.text)
                 self.assertNotIn("sensitive-validation-marker", invalid_body.text)
 
-                bridge.stream_response = _fake_error_stream
+                module._original_stream_response = _fake_error_stream
                 provider_error = await client.post("/v1/chat/completions", json={
                     "model": backend_model,
                     "messages": messages,
@@ -132,7 +137,7 @@ class ApiSmokeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(provider_error.status_code, 502, provider_error.text)
                 self.assertEqual(provider_error.json()["error"]["code"], "provider_error")
 
-                bridge.stream_response = _fake_stream_response
+                module._original_stream_response = _fake_stream_response
                 streaming = await client.post("/v1/chat/completions", json={
                     "model": backend_model,
                     "messages": messages,
